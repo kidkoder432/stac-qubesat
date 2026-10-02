@@ -1,0 +1,6 @@
+.DS_Store
+stubs
+.vscode
+adafruit
+.venv
+lib
