@@ -17,7 +17,7 @@ import time
 
 from StateCodeGenerator import StateID
 
-from pycubed import cubesat
+from lib.pycubed import cubesat
 
 # ── State codes ────────────────────────────────────────────────────────────────
 # Must stay in sync with StateID in StateCodeGenerator.py.

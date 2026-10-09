@@ -1,10 +1,10 @@
 import time
 
-import board
+import board 
 import digitalio
 import pwmio
 
-import pycubed
+import lib.pycubed as pycubed
 
 
 class BurnWire:
@@ -27,6 +27,8 @@ class BurnWire:
             burnwire = pwmio.PWMOut(board.BURN1, frequency=self.freq, duty_cycle=0)
         elif burn_num == "2":
             burnwire = pwmio.PWMOut(board.BURN2, frequency=self.freq, duty_cycle=0)
+        else:
+            raise ValueError("Invalid burn number")
 
         burnwire.duty_cycle = int((dutycycle / 100) * (0xFFFF))
         print(f"Wire {burn_num} has started burning")

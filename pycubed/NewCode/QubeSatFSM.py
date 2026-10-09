@@ -6,7 +6,7 @@ from PowerLevel import PowerLevel
 from StateCodeGenerator import StateCodec, StateID
 from Task import Task
 
-from pycubed import cubesat
+from lib.pycubed import cubesat
 
 
 class TemperatureCheck:
