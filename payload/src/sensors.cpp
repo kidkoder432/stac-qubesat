@@ -240,7 +240,7 @@ bool readPhotodiodeSensor(int cs_pin, int device_num, int channel_num, float& ph
 
   uint16_t adc_control_single = 0x0104;
   ad4130_write_register_16(cs_pin, AD4130_REG_ADC_CONTROL, adc_control_single);
-  Serial.printf("  ✓ Started single sequence mode (0x%04X)\n", adc_control_single);
+  // Serial.printf("  ✓ Started single sequence mode (0x%04X)\n", adc_control_single);
 
   int timeout = 1000;
   uint8_t status = 0;
@@ -257,15 +257,17 @@ bool readPhotodiodeSensor(int cs_pin, int device_num, int channel_num, float& ph
     return false;
   }
 
-  Serial.printf("  ✓ Conversion complete after %d ms (status: 0x%02X)\n", 1000 - timeout, status);
+  // Serial.printf("  ✓ Conversion complete after %d ms (status: 0x%02X)\n", 1000 - timeout, status);
 
   uint32_t adc_data = ad4130_read_data(cs_pin);
-  Serial.printf("  ✓ Raw ADC data: 0x%06X (%u)\n", adc_data, (unsigned int)adc_data);
+  // Serial.printf("  ✓ Raw ADC data: 0x%06X (%u)\n", adc_data, (unsigned int)adc_data);
 
   photocurrent = calculatePhotocurrent(adc_data);
 
   uint16_t adc_control_idle = 0x0110;
   ad4130_write_register_16(cs_pin, AD4130_REG_ADC_CONTROL, adc_control_idle);
+
+  Serial.printf("  ✓ Photocurrent: %.3f nA\n", photocurrent * 1e9);
 
   return true;
 }
