@@ -6,7 +6,7 @@ Uses a simplified, fixed-length binary protocol with modulo-256 checksums over U
 import struct
 import time
 
-START1 = 0x57  # 'W'
+START1 = 0x57
 START2 = 0xAC
 
 # Packet Response Signatures
@@ -86,7 +86,7 @@ class PayloadUART:
         expected_type: int,
         expected_len: int,
         timeout: float = 1.0,
-        retries: int = 2,
+        retries: int = 3,
     ):
         """
         Sends a 6-byte command packet and waits for expected response.
