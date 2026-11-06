@@ -4,3 +4,4 @@ stubs
 adafruit
 .venv
 lib
+__pycache__/
