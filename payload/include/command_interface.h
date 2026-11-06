@@ -4,7 +4,7 @@
 
 // ======================= PROTOCOL SIGNATURE & PACKET TYPES =======================
 
-#define PKT_START1          0x57  // 'W'
+#define PKT_START1          0x57
 #define PKT_START2          0xAC
 
 // Packet Types / Responses

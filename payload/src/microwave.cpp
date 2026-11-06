@@ -6,20 +6,48 @@
 void hmc832_sendBytes(uint32_t data, uint8_t addressByte) {
   uint8_t b0 = (data >> 16) & 0xFF;
   uint8_t b1 = (data >> 8) & 0xFF;
-  uint8_t b2 = data & 0xFF;
 
-  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE2));
+  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
   digitalWrite(MIC_SEN, LOW);
-  delayMicroseconds(1);
 
   SPI.transfer(b0);
   SPI.transfer(b1);
-  SPI.transfer(b2);
-  SPI.transfer(addressByte);
+  SPI.transfer(data & 0xFF);
+  SPI.transfer(addressByte);  // pre-shifted: reg address << 3 | chip ID (000b)
 
-  delayMicroseconds(1);
   digitalWrite(MIC_SEN, HIGH);
   SPI.endTransaction();
+}
+
+// Two-cycle read (datasheet "Serial Port Read Operation"): cycle 1 writes the
+// target address to Reg 0x00[4:0], cycle 2 shifts that register out on LD/SDO.
+// Verified against a bit-banged read: the first bit sampled in cycle 2 is D23.
+// Returns false if SDO reads all 0s or all 1s (no response from the chip).
+bool hmc832_readRegister(uint8_t regAddr, uint32_t& readData) {
+  uint8_t b2 = regAddr & 0x1F;  // D[4:0] = address to read, D[23:5] = 0
+
+  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+
+  digitalWrite(MIC_SEN, LOW);
+  SPI.transfer(0);
+  SPI.transfer(0);
+  SPI.transfer(b2);
+  SPI.transfer(0x00);  // reg 0x00, chip address 000b
+  digitalWrite(MIC_SEN, HIGH);  // latches the read address
+  delayMicroseconds(2);
+
+  digitalWrite(MIC_SEN, LOW);
+  uint32_t raw = 0;
+  raw |= (uint32_t)SPI.transfer(0) << 24;
+  raw |= (uint32_t)SPI.transfer(0) << 16;
+  raw |= (uint32_t)SPI.transfer(b2) << 8;
+  raw |= SPI.transfer(0x00);
+  digitalWrite(MIC_SEN, HIGH);
+
+  SPI.endTransaction();
+
+  readData = raw >> 8;  // 24-bit register payload; low byte is the address echo
+  return raw != 0x00000000 && raw != 0xFFFFFFFF;
 }
 
 void hmc832_Set_VCO_Out_Divider(int divisor) {
@@ -51,7 +79,7 @@ void hmc832_Initialize_Microwave_Generator() {
 
   if (!v10_enabled) {
     Serial.println("Enabling 10V rail for microwave module...");
-    toggle10V();
+    set10V(true);
     delay(200);
   }
 
@@ -100,7 +128,7 @@ void hmc832_Initialize_Microwave_Generator() {
   uint8_t VarThreeFour = 0b01100110;
 
   auto burstWrite = [&](uint8_t d0, uint8_t d1, uint8_t d2, uint8_t addr) {
-    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE2));
+    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
     digitalWrite(MIC_SEN, LOW);
     delayMicroseconds(1);
 
@@ -141,43 +169,35 @@ void hmc832_Initialize_Microwave_Generator() {
 void testMicrowave() {
   Serial.println("\n--- Microwave Module Test (EVAL-HMC832A) ---");
 
-  if (!mic_enabled) {
-    SPI.begin(MIC_SCK, MIC_SDO, MIC_SDI, MIC_SEN);
-    mic_enabled = true;
+  // Init powers the 10V rail and regulators and sets 3.3V SDO (Reg 0x0B[22])
+  hmc832_Initialize_Microwave_Generator();
+
+  // SPI readback: Reg 0x00 is the read-only chip ID
+  const uint32_t expected_id = 0x0F3275;
+  uint32_t chip_id = 0;
+  bool responded = hmc832_readRegister(0x00, chip_id);
+  Serial.printf("Chip ID: 0x%06X (expected 0x%06X)\n", chip_id, expected_id);
+
+  if (!responded) {
+    Serial.println("✗ No SPI response. Check jumpers JP1-JP5, MIC_REGEN, 5.5V supply and SPI wiring");
+  } else if (chip_id != expected_id) {
+    Serial.println("⚠ Unexpected chip ID - check SPI mode and wiring");
+  } else {
+    Serial.println("✓ SPI readback OK");
   }
 
-  if (!v10_enabled) {
-    Serial.println("Enabling 10V rail for microwave module...");
-    toggle10V();
-    delay(200);
-  }
+  // // Set 2800 MHz and check lock detect on LD/SDO
+  // hmc832_sendBytes(0x4DB8, 0b00101000); // max gain
+  // hmc832_sendBytes(0x90, 0b00101000);   // divider = 1
+  // hmc832_sendBytes(0x1, 0b00010000);    // ref divider = 1
+  // hmc832_Set_VCO_Frequency(2800);
+  // delay(50);
 
-  digitalWrite(MIC_REGEN, HIGH);
-  delay(100);
-  Serial.println("✓ Microwave module powered on");
-
-  Serial.printf("MIC_REGEN: %s\n", digitalRead(MIC_REGEN) ? "HIGH" : "LOW");
-  Serial.printf("MIC_SEN: %s\n", digitalRead(MIC_SEN) ? "HIGH" : "LOW");
-
-  // Simple SPI read test (not full init)
-  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE2));
-  digitalWrite(MIC_SEN, LOW);
-  uint8_t response = SPI.transfer(0x00);
-  digitalWrite(MIC_SEN, HIGH);
-  SPI.endTransaction();
-
-  Serial.printf("SPI Response: 0x%02X\n", response);
-
-  if (response == 0x00 || response == 0xFF) {
-    Serial.println("⚠ Module may not be responding properly");
-    Serial.println("  Check:");
-    Serial.println("  - Power supply (10V rail)");
-    Serial.println("  - SPI connections");
-    Serial.println("  - Module initialization sequence");
-  }
-  else {
-    Serial.println("✓ Module appears to be responding");
-  }
+  // if (digitalRead(MIC_SDO)) {
+  //   Serial.println("✓ PLL locked at 2800 MHz");
+  // } else {
+  //   Serial.println("⚠ PLL not locked (check 50 MHz reference and RF connections)");
+  // }
 }
 
 void runMicrowaveContrastSweep() {
