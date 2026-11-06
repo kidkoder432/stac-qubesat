@@ -35,12 +35,18 @@
 #define AD4130_MODE_STANDBY         0x02
 #define AD4130_MODE_IDLE            0x04
 
+// ADC_CONTROL values: INT_REF_EN (bit 8) and CSB_EN (bit 9, enables the CS pin) set
+#define AD4130_ADC_CONTROL_IDLE     0x0310  // MODE=0100 (IDLE)
+#define AD4130_ADC_CONTROL_SINGLE   0x0304  // MODE=0001 (single sequence)
+
 // Silicon ID bits (3:2) == 0b01 for AD4130 family
 #define AD4130_SILICON_ID_EXPECTED  0x01
 
 // ======================= AD4130 LOW LEVEL SPI FUNCTIONS =======================
 
 void initRTDSPI();
+void ad4130_cs_assert(int cs_pin);
+void ad4130_reset(int cs_pin);
 
 uint8_t  ad4130_read_register(int cs_pin, uint8_t reg);
 void     ad4130_write_register(int cs_pin, uint8_t reg, uint8_t data);

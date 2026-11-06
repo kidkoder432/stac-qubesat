@@ -28,8 +28,8 @@ RTDConfig rtd_configs[7] = {
   { 9, 10, 11, 1, RTD_CS1, false },// RTD4: needs board/datasheet check
   { 12, 13, 14, 1, RTD_CS1, false },// RTD5: needs board/datasheet check
   // RTD6-7 on Device 2
-  { 0, 1, 2, 2, RTD_CS2, false },  // RTD6: disabled by default
-  { 3, 4, 5, 2, RTD_CS2, false }   // RTD7: disabled by default
+  { 0, 1, 2, 2, RTD_CS2, true },  // RTD6: disabled by default
+  { 3, 4, 5, 2, RTD_CS2, true }   // RTD7: disabled by default
 };
 
 // RTD calibration data

@@ -23,6 +23,7 @@ void printMenu() {
   Serial.println("  rtd cal                  - Calibrate RTDs            (shortcut: 'c')");
   Serial.println("  rtd mon                  - Continuous RTD stream     (shortcut: 't')");
   Serial.println("  pd                       - Read photodiode current   (shortcut: 'p')");
+  Serial.println("  csscan                   - Scan AD4130 chip-select combinations");
   Serial.println("  bat                      - Read INA228 bat monitor   (shortcut: '3')");
   Serial.println("\n[MICROWAVE / ODMR]");
   Serial.println("  mw test                  - Test synthesizer SPI      (shortcut: '5')");
@@ -261,6 +262,9 @@ void processDeveloperCommand(String cmdLine) {
   // ---------------- PHOTODIODE & BATTERY ----------------
   else if (cmdLower == "pd" || cmdLower == "photo") {
     readPhotodiode();
+  }
+  else if (cmdLower == "csscan") {
+    scanADCChipSelects();
   }
   else if (cmdLower == "bat" || cmdLower == "battery") {
     testBatteryMonitor();

@@ -28,3 +28,4 @@ void readRTDTemperatures();
 void calibrateRTDs();
 void continuousRTDMonitoring();
 void testRTD();
+void scanADCChipSelects();

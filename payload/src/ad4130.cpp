@@ -1,8 +1,40 @@
 #include "ad4130.h"
 
+// Both AD4130 chip selects are driven manually. Per the schematic CS1 must be
+// high whenever CS2 is low, so the other CS is forced high before asserting one.
+void ad4130_cs_assert(int cs_pin) {
+  int other_cs = (cs_pin == RTD_CS1) ? RTD_CS2 : RTD_CS1;
+  digitalWrite(other_cs, HIGH);
+  digitalWrite(cs_pin, LOW);
+}
+
+// Datasheet reset: 64 consecutive 1s. Afterwards CSB_EN is set so each chip honours
+// its CS pin; with it cleared (the reset default) both AD4130s listen to every SCLK
+// edge on the shared bus and a short frame leaves the other chip out of sync.
+// While CSB_EN is still 0 on both chips, the reset and ADC_CONTROL write below reach
+// both of them regardless of which CS is asserted.
+void ad4130_reset(int cs_pin) {
+  RTD_SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
+  ad4130_cs_assert(cs_pin);
+  for (int i = 0; i < 8; i++) {
+    RTD_SPI.transfer(0xFF);
+  }
+  digitalWrite(cs_pin, HIGH);
+  RTD_SPI.endTransaction();
+  delay(100);
+
+  ad4130_write_register_16(cs_pin, AD4130_REG_ADC_CONTROL, AD4130_ADC_CONTROL_IDLE);
+  delay(10);
+}
+
 void initRTDSPI() {
   if (!rtd_enabled) {
-    RTD_SPI.begin(RTD_SCLK, RTD_DOUT, RTD_DIN, RTD_CS1);
+    pinMode(RTD_CS1, OUTPUT);
+    pinMode(RTD_CS2, OUTPUT);
+    digitalWrite(RTD_CS1, HIGH);
+    digitalWrite(RTD_CS2, HIGH);
+    // ss = -1: keep the SPI peripheral from driving CS1 as a hardware chip select
+    RTD_SPI.begin(RTD_SCLK, RTD_DOUT, RTD_DIN, -1);
     rtd_enabled = true;
     delay(100);
   }
@@ -10,7 +42,7 @@ void initRTDSPI() {
 
 uint16_t ad4130_read_register_16(int cs_pin, uint8_t reg) {
   RTD_SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
-  digitalWrite(cs_pin, LOW);
+  ad4130_cs_assert(cs_pin);
   delayMicroseconds(1);
 
   RTD_SPI.transfer(AD4130_CMD_READ | reg);
@@ -25,7 +57,7 @@ uint16_t ad4130_read_register_16(int cs_pin, uint8_t reg) {
 
 void ad4130_write_register_16(int cs_pin, uint8_t reg, uint16_t data) {
   RTD_SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
-  digitalWrite(cs_pin, LOW);
+  ad4130_cs_assert(cs_pin);
   delayMicroseconds(1);
 
   RTD_SPI.transfer(AD4130_CMD_WRITE | reg);
@@ -39,7 +71,7 @@ void ad4130_write_register_16(int cs_pin, uint8_t reg, uint16_t data) {
 
 uint32_t ad4130_read_register_24(int cs_pin, uint8_t reg) {
   RTD_SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
-  digitalWrite(cs_pin, LOW);
+  ad4130_cs_assert(cs_pin);
   delayMicroseconds(1);
 
   RTD_SPI.transfer(AD4130_CMD_READ | reg);
@@ -57,7 +89,7 @@ uint32_t ad4130_read_register_24(int cs_pin, uint8_t reg) {
 
 void ad4130_write_register_24(int cs_pin, uint8_t reg, uint32_t data) {
   RTD_SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
-  digitalWrite(cs_pin, LOW);
+  ad4130_cs_assert(cs_pin);
   delayMicroseconds(1);
 
   RTD_SPI.transfer(AD4130_CMD_WRITE | reg);
@@ -72,7 +104,7 @@ void ad4130_write_register_24(int cs_pin, uint8_t reg, uint32_t data) {
 
 uint8_t ad4130_read_register(int cs_pin, uint8_t reg) {
   RTD_SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
-  digitalWrite(cs_pin, LOW);
+  ad4130_cs_assert(cs_pin);
   delayMicroseconds(1);
 
   RTD_SPI.transfer(AD4130_CMD_READ | reg);
@@ -87,7 +119,7 @@ uint8_t ad4130_read_register(int cs_pin, uint8_t reg) {
 
 void ad4130_write_register(int cs_pin, uint8_t reg, uint8_t data) {
   RTD_SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
-  digitalWrite(cs_pin, LOW);
+  ad4130_cs_assert(cs_pin);
   delayMicroseconds(1);
 
   RTD_SPI.transfer(AD4130_CMD_WRITE | reg);
@@ -100,7 +132,7 @@ void ad4130_write_register(int cs_pin, uint8_t reg, uint8_t data) {
 
 uint32_t ad4130_read_data(int cs_pin) {
   RTD_SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
-  digitalWrite(cs_pin, LOW);
+  ad4130_cs_assert(cs_pin);
   delayMicroseconds(1);
 
   RTD_SPI.transfer(AD4130_CMD_READ | AD4130_REG_DATA);

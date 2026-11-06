@@ -1,5 +1,6 @@
 #include "sensors.h"
 #include "power.h"
+#include "driver/gpio.h"
 
 // ======================= AD4130 CONFIG: RTD =======================
 
@@ -10,12 +11,7 @@ bool ad4130_configure_for_rtd_generic(int cs_pin, int device_num, int channel_nu
 
   // Reset device only for first channel
   if (channel_num == 0) {
-    RTD_SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
-    digitalWrite(cs_pin, LOW);
-    RTD_SPI.transfer(AD4130_CMD_RESET);
-    digitalWrite(cs_pin, HIGH);
-    RTD_SPI.endTransaction();
-    delay(100);
+    ad4130_reset(cs_pin);
 
     // Verify device ID (by silicon_id bits)
     uint8_t id = ad4130_read_register(cs_pin, AD4130_REG_ID);
@@ -30,7 +26,7 @@ bool ad4130_configure_for_rtd_generic(int cs_pin, int device_num, int channel_nu
       silicon_id, model_id, id);
 
     // ADC control: IDLE mode, internal reference enabled
-    uint16_t adc_control_val = 0x0110;  // INT_REF_EN=1, MODE=0100 (IDLE)
+    uint16_t adc_control_val = AD4130_ADC_CONTROL_IDLE;
     ad4130_write_register_16(cs_pin, AD4130_REG_ADC_CONTROL, adc_control_val);
     delay(10);
     uint16_t adc_readback = ad4130_read_register_16(cs_pin, AD4130_REG_ADC_CONTROL);
@@ -77,12 +73,7 @@ bool ad4130_configure_for_rtd(int cs_pin, int device_num) {
   Serial.printf("Configuring AD4130 #%d for RTD measurement...\n", device_num);
 
   // Reset
-  RTD_SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
-  digitalWrite(cs_pin, LOW);
-  RTD_SPI.transfer(AD4130_CMD_RESET);
-  digitalWrite(cs_pin, HIGH);
-  RTD_SPI.endTransaction();
-  delay(100);
+  ad4130_reset(cs_pin);
 
   // Verify ID
   uint8_t id = ad4130_read_register(cs_pin, AD4130_REG_ID);
@@ -96,7 +87,7 @@ bool ad4130_configure_for_rtd(int cs_pin, int device_num) {
     silicon_id, model_id, id);
 
   // ADC control to IDLE, internal reference
-  uint16_t adc_control_val = 0x0110;  // INT_REF_EN=1, MODE=0100 (IDLE)
+  uint16_t adc_control_val = AD4130_ADC_CONTROL_IDLE;
   ad4130_write_register_16(cs_pin, AD4130_REG_ADC_CONTROL, adc_control_val);
   delay(10);
   uint16_t adc_readback = ad4130_read_register_16(cs_pin, AD4130_REG_ADC_CONTROL);
@@ -165,6 +156,42 @@ bool ad4130_configure_for_photodiode(int cs_pin, int device_num, int channel_num
   Serial.printf("Configuring AD4130 #%d Channel %d for photodiode measurement...\n", device_num, channel_num);
   Serial.printf("  Pin config: AIN%d (photodiode input)\n", PHOTODIODE_AIN);
 
+  // Reset device and verify it is actually responding before configuring
+  ad4130_reset(cs_pin);
+
+  uint8_t id = ad4130_read_register(cs_pin, AD4130_REG_ID);
+  uint8_t silicon_id = (id >> 2) & 0x03;
+  if (silicon_id != AD4130_SILICON_ID_EXPECTED) {
+    Serial.printf("  ✗ AD4130 #%d not responding (raw ID=0x%02X). Check 5V/AVDD, CS pin %d, and MISO.\n",
+      device_num, id, cs_pin);
+    return false;
+  }
+  Serial.printf("  ✓ AD4130 Device detected (raw ID=0x%02X)\n", id);
+
+  // ADC control: IDLE mode, internal reference enabled
+  uint16_t adc_control_val = AD4130_ADC_CONTROL_IDLE;
+  ad4130_write_register_16(cs_pin, AD4130_REG_ADC_CONTROL, adc_control_val);
+  delay(10);
+  uint16_t adc_readback = ad4130_read_register_16(cs_pin, AD4130_REG_ADC_CONTROL);
+  Serial.printf("  ADC Control: wrote 0x%04X, read 0x%04X\n", adc_control_val, adc_readback);
+  if (adc_readback != adc_control_val) {
+    Serial.println("  ✗ ADC_CONTROL readback mismatch");
+    return false;
+  }
+
+  // Setup 0: no excitation currents, internal reference (REF_SEL=10) with buffers, PGA gain 1
+  uint16_t config0_val = (0x01 << 7) |   // REF_BUFP = 1
+    (0x01 << 6) |                        // REF_BUFM = 1
+    (0x02 << 4);                         // REF_SEL = 10 (internal, REFOUT/AVSS)
+  ad4130_write_register_16(cs_pin, AD4130_REG_CONFIG_0, config0_val);
+  delay(10);
+  uint16_t config0_readback = ad4130_read_register_16(cs_pin, AD4130_REG_CONFIG_0);
+  Serial.printf("  CONFIG_0: wrote 0x%04X, read 0x%04X\n", config0_val, config0_readback);
+  if (config0_readback != config0_val) {
+    Serial.println("  ✗ CONFIG_0 readback mismatch");
+    return false;
+  }
+
   // Channel config: single-ended, AINP=PHOTODIODE_AIN, AINM=AVSS (encoded as 17)
   uint32_t channel_config = 0x800000 |
     (0x00 << 20) |
@@ -173,7 +200,11 @@ bool ad4130_configure_for_photodiode(int cs_pin, int device_num, int channel_num
   ad4130_write_register_24(cs_pin, AD4130_REG_CHANNEL_0 + channel_num, channel_config);
   delay(10);
   uint32_t channel_readback = ad4130_read_register_24(cs_pin, AD4130_REG_CHANNEL_0 + channel_num);
-  Serial.printf("  ✓ Channel %d configured: wrote 0x%06X, read 0x%06X\n", channel_num, channel_config, channel_readback);
+  Serial.printf("  Channel %d: wrote 0x%06X, read 0x%06X\n", channel_num, channel_config, channel_readback);
+  if (channel_readback != channel_config) {
+    Serial.printf("  ✗ Channel %d readback mismatch\n", channel_num);
+    return false;
+  }
 
   Serial.printf("  ✓ AD4130 #%d Channel %d photodiode configuration complete\n", device_num, channel_num);
   return true;
@@ -197,7 +228,7 @@ bool readRTDSensorGeneric(int cs_pin, int device_num, int channel_num, float& te
   Serial.printf("Reading RTD sensor device #%d channel %d...\n", device_num, channel_num);
 
   // Single sequence measurement
-  uint16_t adc_control_single = 0x0104;  // MODE=0001 (Single Seq), INT_REF_EN=1
+  uint16_t adc_control_single = AD4130_ADC_CONTROL_SINGLE;
   ad4130_write_register_16(cs_pin, AD4130_REG_ADC_CONTROL, adc_control_single);
   Serial.printf("  ✓ Started single sequence mode (0x%04X)\n", adc_control_single);
 
@@ -229,7 +260,7 @@ bool readRTDSensorGeneric(int cs_pin, int device_num, int channel_num, float& te
   Serial.printf("  ✓ Calculated temperature: %.2f °C\n", temperature);
 
   // Return to IDLE
-  uint16_t adc_control_idle = 0x0110;
+  uint16_t adc_control_idle = AD4130_ADC_CONTROL_IDLE;
   ad4130_write_register_16(cs_pin, AD4130_REG_ADC_CONTROL, adc_control_idle);
 
   return true;
@@ -238,7 +269,7 @@ bool readRTDSensorGeneric(int cs_pin, int device_num, int channel_num, float& te
 bool readPhotodiodeSensor(int cs_pin, int device_num, int channel_num, float& photocurrent) {
   Serial.printf("Reading photodiode sensor device #%d channel %d...\n", device_num, channel_num);
 
-  uint16_t adc_control_single = 0x0104;
+  uint16_t adc_control_single = AD4130_ADC_CONTROL_SINGLE;
   ad4130_write_register_16(cs_pin, AD4130_REG_ADC_CONTROL, adc_control_single);
   // Serial.printf("  ✓ Started single sequence mode (0x%04X)\n", adc_control_single);
 
@@ -264,7 +295,7 @@ bool readPhotodiodeSensor(int cs_pin, int device_num, int channel_num, float& ph
 
   photocurrent = calculatePhotocurrent(adc_data);
 
-  uint16_t adc_control_idle = 0x0110;
+  uint16_t adc_control_idle = AD4130_ADC_CONTROL_IDLE;
   ad4130_write_register_16(cs_pin, AD4130_REG_ADC_CONTROL, adc_control_idle);
 
   Serial.printf("  ✓ Photocurrent: %.3f nA\n", photocurrent * 1e9);
@@ -507,6 +538,95 @@ void testRTD() {
   testAD4130(RTD_CS2, RTD_INT2, 2);
 
   Serial.println("For full RTD temperature reading, use 'r' command");
+}
+
+// Try every (CS1, CS2) level combination and print the ID each one returns, to
+// find which pin pattern actually selects each AD4130.
+void scanADCChipSelects() {
+  Serial.println("\n--- AD4130 Chip Select Scan ---");
+
+  initRTDSPI();
+
+  if (!v5_enabled) {
+    Serial.println("Enabling 5V rail...");
+    toggle5V();
+    delay(500);
+  }
+
+  auto scan = [](const char* label) {
+    Serial.printf("%s\n", label);
+    for (int cs1 = 0; cs1 <= 1; cs1++) {
+      for (int cs2 = 0; cs2 <= 1; cs2++) {
+        digitalWrite(RTD_CS1, cs1);
+        digitalWrite(RTD_CS2, cs2);
+
+        RTD_SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
+        delayMicroseconds(1);
+        RTD_SPI.transfer(AD4130_CMD_READ | AD4130_REG_ID);
+        uint8_t id = RTD_SPI.transfer(0x00);
+        delayMicroseconds(1);
+        RTD_SPI.endTransaction();
+
+        Serial.printf("  CS1=%s CS2=%s -> ID=0x%02X%s\n",
+          cs1 ? "HIGH" : "LOW ", cs2 ? "HIGH" : "LOW ", id,
+          ((id >> 2) & 0x03) == AD4130_SILICON_ID_EXPECTED ? "  <- AD4130" : "");
+      }
+    }
+    digitalWrite(RTD_CS1, HIGH);
+    digitalWrite(RTD_CS2, HIGH);
+  };
+
+  scan("Before reset (chips may be out of sync):");
+
+  // 64-ones reset + CSB_EN on both chips, then scan again
+  ad4130_reset(RTD_CS1);
+  ad4130_reset(RTD_CS2);
+  scan("After 64-bit reset + CSB_EN:");
+
+  // Is anything driving MISO with only CS2 selected? Compare the ID under different
+  // MISO pulls and SPI settings: a floating line follows the pull, a driven one doesn't.
+  Serial.println("MISO drive test (CS1=HIGH, CS2=LOW):");
+  struct { const char* name; gpio_pull_mode_t pull; } pulls[] = {
+    { "pull-up  ", GPIO_PULLUP_ONLY },
+    { "pull-down", GPIO_PULLDOWN_ONLY },
+  };
+  uint32_t clocks[] = { 1000000, 100000 };
+  uint8_t modes[] = { SPI_MODE3, SPI_MODE0 };
+  for (auto& pull : pulls) {
+    gpio_set_pull_mode((gpio_num_t)RTD_DOUT, pull.pull);
+    for (int m = 0; m < 2; m++) {
+      for (int c = 0; c < 2; c++) {
+        digitalWrite(RTD_CS1, HIGH);
+        digitalWrite(RTD_CS2, LOW);
+        RTD_SPI.beginTransaction(SPISettings(clocks[c], MSBFIRST, modes[m]));
+        RTD_SPI.transfer(AD4130_CMD_READ | AD4130_REG_ID);
+        uint8_t id = RTD_SPI.transfer(0x00);
+        RTD_SPI.endTransaction();
+        digitalWrite(RTD_CS2, HIGH);
+        Serial.printf("  %s mode%d %7lu Hz -> 0x%02X\n", pull.name,
+          modes[m] == SPI_MODE3 ? 3 : 0, (unsigned long)clocks[c], id);
+      }
+    }
+  }
+
+  // Same pull-up read with each CS combination: a line that only goes low when CS2 is
+  // asserted is being driven by IC3; one that is always low is held by something else.
+  Serial.println("MISO with pull-up, per CS combination:");
+  gpio_set_pull_mode((gpio_num_t)RTD_DOUT, GPIO_PULLUP_ONLY);
+  for (int cs1 = 0; cs1 <= 1; cs1++) {
+    for (int cs2 = 0; cs2 <= 1; cs2++) {
+      digitalWrite(RTD_CS1, cs1);
+      digitalWrite(RTD_CS2, cs2);
+      RTD_SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE3));
+      RTD_SPI.transfer(AD4130_CMD_READ | AD4130_REG_ID);
+      uint8_t id = RTD_SPI.transfer(0x00);
+      RTD_SPI.endTransaction();
+      Serial.printf("  CS1=%s CS2=%s -> 0x%02X\n", cs1 ? "HIGH" : "LOW ", cs2 ? "HIGH" : "LOW ", id);
+    }
+  }
+  digitalWrite(RTD_CS1, HIGH);
+  digitalWrite(RTD_CS2, HIGH);
+  gpio_set_pull_mode((gpio_num_t)RTD_DOUT, GPIO_FLOATING);
 }
 
 // Payload helpers
