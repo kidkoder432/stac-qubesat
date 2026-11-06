@@ -25,8 +25,8 @@ RTDConfig rtd_configs[7] = {
   { 0, 1, 2, 1, RTD_CS1, true },   // RTD1: AIN0(IOUT), AIN1(+), AIN2(-)
   { 3, 4, 5, 1, RTD_CS1, true },   // RTD2: AIN3(IOUT), AIN4(+), AIN5(-)
   { 6, 7, 8, 1, RTD_CS1, true },   // RTD3: AIN6(IOUT), AIN7(+), AIN8(-)
-  { 9, 10, 11, 1, RTD_CS1, false },// RTD4: needs board/datasheet check
-  { 12, 13, 14, 1, RTD_CS1, false },// RTD5: needs board/datasheet check
+  { 9, 10, 11, 1, RTD_CS1, true },// RTD4: needs board/datasheet check
+  { 12, 13, 14, 1, RTD_CS1, true },// RTD5: needs board/datasheet check
   // RTD6-7 on Device 2
   { 0, 1, 2, 2, RTD_CS2, true },  // RTD6: disabled by default
   { 3, 4, 5, 2, RTD_CS2, true }   // RTD7: disabled by default

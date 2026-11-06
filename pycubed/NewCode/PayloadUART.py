@@ -60,6 +60,11 @@ class PayloadUART:
 
         # Ensure UART baudrate is 115200 for ESP32 payload link
         if self.uart is not None:
+            import board
+            import busio
+
+            self.uart.deinit()
+            self.uart = busio.UART(board.TX2, board.RX2, baudrate=115200)
             try:
                 if hasattr(self.uart, "baudrate") and self.uart.baudrate != 115200:
                     self.uart.baudrate = 115200
@@ -69,7 +74,7 @@ class PayloadUART:
                     import busio
 
                     self.uart.deinit()
-                    self.uart = busio.UART(board.TX, board.RX, baudrate=115200)
+                    self.uart = busio.UART(board.TX2, board.RX2, baudrate=115200)
                     if satellite and hasattr(satellite, "uart"):
                         satellite.uart = self.uart
                 except Exception:
