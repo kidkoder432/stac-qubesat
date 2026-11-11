@@ -6,16 +6,58 @@ from PowerLevel import PowerLevel
 from StateCodeGenerator import StateCodec, StateID
 from Task import Task
 
+# Same import form as Comms.py. Importing it under two names (pycubed vs lib.pycubed)
+# would load the module twice and create two hardware objects.
 from lib.pycubed import cubesat
+from Comms import build_beacon_packet
+
+import random
+import struct
+
+# "Deployed" flag kept in NVM so a reboot doesn't re-fire the burn wire.
+# The pycubed library uses NVM bytes 0-16 and Comms.py uses 20-26, so 19 is free. Fresh NVM = 0 = not deployed.
+_NVM_DEPLOYED = 19
+_DEPLOYED_MAGIC = 0xD5
+
+try:
+    import microcontroller
+
+    _nvm = microcontroller.nvm
+except ImportError:
+    _nvm = bytearray(256)  # desktop fallback
+
+
+def _load_deployed():
+    try:
+        return _nvm[_NVM_DEPLOYED] == _DEPLOYED_MAGIC
+    except Exception:
+        return False
+
+
+def _save_deployed():
+    try:
+        _nvm[_NVM_DEPLOYED] = _DEPLOYED_MAGIC
+    except Exception as e:
+        print("[FSM] Could not persist deployed flag:", e)
+
+
+
+def _temperature_c():
+    """IMU temperature in degC (the board has no CPU/battery temp sensor), or None."""
+    try:
+        return cubesat.temperature
+    except Exception:
+        return None
 
 
 class TemperatureCheck:
+    MAX_C = 60.0
+
     def is_safe(self):
-        try:
-            temp = getattr(cubesat, "temperature_cpu", 25.0)
-            return temp < 60.0
-        except Exception:
-            return True
+        temp = _temperature_c()
+        if temp is None:
+            return True  # no reading (IMU missing); don't force IDLE on a missing sensor
+        return temp < self.MAX_C
 
 
 class QubeSatFSM:
@@ -23,6 +65,29 @@ class QubeSatFSM:
     low_level_threshold = (
         6.0  # when it reaches this low level -> switch to idle/charging state
     )
+
+    # ---- configurable mission constants (all in seconds unless noted) ----
+    DEPLOY_AFTER_IDLE_S = 60 * 60  # boot in IDLE, go to DEPLOY after this long
+    BURN_MAX_ATTEMPTS = 3  # tries per visit to DEPLOY before falling back to IDLE
+
+    # Antenna watchdog. There is no sensor saying the antenna actually deployed, and if it
+    # didn't, the ground probably can't reach us, so recovery has to be autonomous.
+    # "Ground contact" = a valid command received after the burn ran.
+    BURN_RETRY_BACKOFF_S = 60 * 60  # burn raised an error: retry this often (any state)
+    BURN_REBURN_AFTER_S = 12 * 60 * 60  # burn "worked" but we never heard from ground: re-burn
+    BURN_MAX_TOTAL = 10  # cap on burns that actually ran, per boot (power / heat); errors don't count
+    BAT_THRESH_SCIENCE = 8.0  # volts needed to leave IDLE (low threshold above = 6.0)
+
+    # science vs comms: P(science) falls linearly from MAX to MIN over the mission
+    SCIENCE_WEIGHT_MAX = 1.0  # 100% science at t=0
+    SCIENCE_WEIGHT_MIN = 0.1  # 10% science at end of life
+    MISSION_EOL_S = 90 * 24 * 3600  # 90 day mission
+    STATE_DWELL_S = 10 * 60  # stay in SCIENCE/COMMS at least this long before re-rolling
+
+    # When the ground has locked a state, should a low battery / overheat still force IDLE?
+    # True  = yes (safe: protects against brownout; the lock is cleared when it happens)
+    # False = no, the lock wins no matter what
+    LOW_BATTERY_OVERRIDES_LOCK = True
 
     # initalizing some values/parts of the qubesat (still very incomplete atp)
     """
@@ -35,7 +100,16 @@ class QubeSatFSM:
     def __init__(self):
         self.state = StateID.IDLE  # default state = charging mode
         self.current_code = StateCodec.encode(StateID.IDLE)
-        self.missionTime = 0.0  # how much time has passed so far, 0 at the beginning
+        self.mission_time = 0.0  # seconds since run() started, updated every loop
+        self._start_time = None  # time.monotonic() when run() started
+        self.log_file = None
+        self._state_entered_at = 0.0  # mission_time when the current state began
+        self.deployed = _load_deployed()  # True once the burn wire has fired (persists)
+        self.burn_attempts = 0
+        self.burn_total = 0  # burns attempted since boot (watchdog cap)
+        self._last_burn_time = None  # mission_time of the last burn attempt
+        self.last_ground_contact = None  # mission_time of the first command heard after deploy
+        self.locked = False  # True = ground has locked the state; transition checks do nothing
         self.power = PowerLevel()
         self.temperature = (
             TemperatureCheck()
@@ -48,17 +122,18 @@ class QubeSatFSM:
             "battery_check": 60,
             "transition": 10,
             "sd_card": 30 * 60,
-            "burn_wire": (30 * 60),
+            "burn_wire": 60,  # retry interval if the burn fails (the 60 min wait is DEPLOY_AFTER_IDLE_S)
             "receive_data": 10,
             "record_memory": 10,
             "init_payload": (30 * 60),
+            "watchdog": 10 * 60,
         }
 
         # boolean values to check different stages of mission
         self.experiment_started = (
             False  # this is True if experiment has started/isrunning and false if not
         )
-        self.sd_card_initalized = (
+        self.sd_card_initialized = (
             False  # shouldn't be initalized until after deployment
         )
         self.solar_panels_on = False
@@ -78,18 +153,22 @@ class QubeSatFSM:
         self.current_sweep_freq = 2800  # Start of ODMR sweep range (2800..2950 MHz)
         self.latest_data = None
 
+        self.comms = None
+
         # making a dictionary to be able to call each state
         # should execute all of the actions in each state
         self.tasks = self._build_tasks_for_state(self.state)
 
-    def _build_tasks_for_state(self, state: StateID):
-        builders = {
+    def _state_builders(self):
+        return {
             StateID.IDLE: self.build_idle_tasks,
             StateID.DEPLOY: self.build_deploy_tasks,
             StateID.SCIENCE: self.build_science_tasks,
             StateID.COMMS: self.build_comms_tasks,
         }
-        return builders[state]()
+
+    def _build_tasks_for_state(self, state: StateID):
+        return self._state_builders()[state]()
 
     # building tasks for each of the states
 
@@ -117,24 +196,36 @@ class QubeSatFSM:
                 schedule_later=True,
                 func=self._task_transition_check,
             ),
+            self._watchdog_task(4),
         ]
         return tasks
+
+    def _watchdog_task(self, priority):
+        return Task(
+            "Antenna Watchdog",
+            priority,
+            self.periods["watchdog"],
+            schedule_later=True,
+            func=self._task_antenna_watchdog,
+        )
 
     # initalize sd card -> activate burn wire -> check battery -> beacon -> transition
     def build_deploy_tasks(self):
         tasks = [
+            # one-shot, runs immediately
             Task(
                 "SD_Card",
                 1,
-                self.periods["sd_card"],
+                None,
                 schedule_later=False,
                 func=self._task_init_sd_card,
             ),
+            # fires on entering DEPLOY; retries every period until it works (removes itself)
             Task(
                 "Burn Wire",
                 2,
                 self.periods["burn_wire"],
-                schedule_later=True,
+                schedule_later=False,
                 func=self._task_activate_burn_wire,
             ),
             Task(
@@ -191,39 +282,49 @@ class QubeSatFSM:
                 schedule_later=True,
                 func=self._task_transition_check,
             ),
+            self._watchdog_task(5),
         ]
         return tasks
 
     def build_science_tasks(self):
         tasks = [
+            # one-shot ping of the payload when entering science
             Task(
                 "Initialize Payload",
                 1,
-                self.periods["init_payload"],
+                None,
                 schedule_later=False,
                 func=self._task_init_payload,
             ),
             Task(
-                "Receive Data",
+                "Battery Check",
                 2,
+                self.periods["battery_check"],
+                schedule_later=True,
+                func=self._task_battery_check,
+            ),
+            Task(
+                "Receive Data",
+                3,
                 self.periods["receive_data"],
                 schedule_later=True,
                 func=self._task_receive_data,
             ),
             Task(
                 "Record to Memory",
-                3,
+                4,
                 self.periods["record_memory"],
                 schedule_later=True,
                 func=self._task_record_memory,
             ),
             Task(
                 "Transition Check",
-                4,
+                5,
                 self.periods["transition"],
                 schedule_later=True,
                 func=self._task_transition_check,
             ),
+            self._watchdog_task(6),
         ]
         return tasks
 
@@ -234,15 +335,26 @@ class QubeSatFSM:
 
     # going to start defining the functions that are ran for each action in the tasks
 
-    def transition(self, new_state: StateID):
+    def transition(self, new_state: StateID, force=False):
+        # force=True is for ground commands and safety overrides; everything the
+        # autonomous logic does goes through here with force=False and respects the lock.
+        if self.locked and not force:
+            return
         if new_state == self.state:
             return  # already here, do nothing
+        if new_state not in self._state_builders():
+            # unknown code, or STOP (STOP is a Comms command, not an FSM state)
+            print(f"[FSM] No task list for state {new_state}, ignoring transition.")
+            return
+        print(f"[FSM] Transition: {StateID.name(self.state)} -> {StateID.name(new_state)}")
         self.state = new_state
+        self._state_entered_at = self.mission_time
         self.current_code = StateCodec.encode(
             new_state
         )  # adding this so that when state changes -> so does current code
         self.tasks = self._build_tasks_for_state(new_state)
 
+    # Check for critical battery voltages - not to be used for science. 
     def _task_battery_check(self):
         try:
             vbatt = cubesat.battery_voltage
@@ -250,14 +362,107 @@ class QubeSatFSM:
 
             if not self.temperature.is_safe():
                 print("[BATTERY] Temperature unsafe — going idle.")
-                self.transition(StateID.IDLE)
+                self._safety_idle()
                 return
 
             if vbatt <= self.low_level_threshold:
                 print("[BATTERY] Low battery — going idle.")
-                self.transition(StateID.IDLE)
+                self._safety_idle()
         except Exception as e:
             print("[BATTERY] Check error:", e)
+
+    def _safety_idle(self):
+        """Forced IDLE for low battery / overheating. Overrides a ground lock if configured to."""
+        if self.state == StateID.IDLE:
+            return
+        if self.locked:
+            if not self.LOW_BATTERY_OVERRIDES_LOCK:
+                print("[FSM] Safety wants IDLE but state is locked; staying put.")
+                return
+            print("[FSM] Safety override: clearing ground lock.")
+            self.locked = False
+        self.transition(StateID.IDLE, force=True)
+
+    # ---- ground commands (called by CommsManager) ----
+    def attach_comms(self, comms):
+        """Wire a CommsManager to the FSM: state commands in, telemetry out."""
+        self.comms = comms
+        comms.on_state_command = self.command_state
+        comms.on_tx_window = self._on_tx_window
+
+    def command_state(self, code, lock=False):
+        """
+        Ground says: go to state `code`, and lock (True) or unlock (False) the transition logic.
+        lock=True  -> sit in this state; the transition check does nothing until unlocked
+        lock=False -> go to this state, then autonomous transitions take over again
+        """
+        if not StateID.is_valid(code):
+            print("[FSM] Ground sent unknown state code:", code)
+            return
+        new_state = code
+        print(f"[FSM] Ground command: {StateID.name(new_state)}, lock={bool(lock)}")
+        if self.deployed and self.last_ground_contact is None:
+            self.last_ground_contact = self.mission_time  # antenna evidently works
+        if new_state == StateID.STOP:
+            # Comms has already stopped transmitting (it keeps listening). The FSM keeps
+            # running in its current state; sending any non-zero state resumes transmission.
+            print("[FSM] STOP: transmission halted by Comms, FSM state unchanged.")
+            return
+        self.locked = bool(lock)
+        if new_state == StateID.DEPLOY:
+            # commanding DEPLOY = try the burn wire again, even if it gave up before
+            self.burn_attempts = 0
+            self.transition(new_state, force=True)
+            self.tasks = self._build_tasks_for_state(StateID.DEPLOY)  # also if already in DEPLOY
+        else:
+            self.transition(new_state, force=True)
+
+    def telemetry_packet(self):
+        """
+        13-byte snapshot of internal state, big-endian:
+          u8  packet type/version (0x01). A TinyGS beacon starts with the ASCII callsign
+              (e.g. 'S'), so a first byte of 0x01 identifies this packet.
+          u8  state code
+          u8  flags: b0 locked, b1 deployed, b2 sd, b3 burn wire, b4 payload, b5 solar, b6 radio
+          u8  burn attempts
+          u16 battery, centivolts
+          i16 IMU temp, centi-degC
+          u32 mission time, seconds
+          u8  c_state_err (FSM crash count)
+        """
+        eq = self.equipment_check
+        flags = (
+            (self.locked << 0)
+            | (self.deployed << 1)
+            | (eq["sd_card"] << 2)
+            | (eq["burn_wire"] << 3)
+            | (eq["payload"] << 4)
+            | (eq["solar_panel"] << 5)
+            | (eq["radio"] << 6)
+        )
+        try:
+            vbatt = int(cubesat.battery_voltage * 100)
+        except Exception:
+            vbatt = 0
+        t = _temperature_c()
+        temp = int(t * 100) if t is not None else 0
+        err = getattr(cubesat, "c_state_err", 0)
+        return struct.pack(
+            ">BBBBHhIB",
+            1,
+            int(self.state),
+            flags,
+            self.burn_attempts & 0xFF,
+            max(0, min(vbatt, 0xFFFF)),
+            max(-32768, min(temp, 32767)),
+            int(self.mission_time),
+            err & 0xFF,
+        )
+
+    def _on_tx_window(self, window_num, cadence):
+        """CommsManager calls this at the start of each TX window."""
+        if self.comms and window_num % max(1, cadence) == 0:
+            self.comms.push_telemetry(self.telemetry_packet())
 
     def halt_transmission(self):
         # stop beacon and any outgoing radio tasks
@@ -268,32 +473,76 @@ class QubeSatFSM:
     # i think solar input is enabled by hardware and not software, so ill just check current for now
     def _task_enable_solar_panels(self):
         try:
-            charging_current = cubesat.charging_current
-            print(f"[COMMS] Charge current: {charging_current:.3f} A")
-            if charging_current > 0:
+            # board API: solar_charging (bool, LTC4121 CHRG pin) and charge_current (mA)
+            charging = cubesat.solar_charging
+            print(f"[COMMS] Solar charging: {charging}, {cubesat.charge_current:.1f} mA")
+            if charging:
                 self.solar_panels_on = True
                 self.equipment_check["solar_panel"] = True
                 print("[COMMS] Solar panels confirmed charging.")
             else:
                 self.solar_panels_on = False
-                print("[COMMS] Warning: No charge current detected.")
+                print("[COMMS] Warning: solar panels are not charging.")
         except Exception as e:
             print("[COMMS] Solar panel check error:", e)
 
     # burn wire clAss is already made -> just need to call it
     def _task_activate_burn_wire(self):
+        self.burn_attempts += 1
+        self._last_burn_time = self.mission_time
         try:
             burn = BurnWire()
             burn.cubesatBurn("1", 0.25, 30)  # burn wire 1, 25% duty cycle, 30 seconds
             self.solar_panels_on = True  # burn wire deploys panels
             self.equipment_check["burn_wire"] = True
+            self.burn_total += 1  # only burns that actually ran count toward the cap
+            self.deployed = True
+            _save_deployed()
             print(f"[DEPLOY] Burn wire status: {burn.burningCheck()}")
+            self._remove_task("Burn Wire")
         except Exception as e:
-            print("[DEPLOY] Burn wire error:", e)
+            print(f"[DEPLOY] Burn wire error (attempt {self.burn_attempts}):", e)
+            if self.burn_attempts >= self.BURN_MAX_ATTEMPTS:
+                print("[DEPLOY] Burn wire giving up.")
+                self._remove_task("Burn Wire")
+
+    def _task_antenna_watchdog(self):
+        """
+        Re-fire the burn wire if the antenna may not have deployed:
+          - a burn raised an error and we never got a good one -> retry every BURN_RETRY_BACKOFF_S
+          - a burn ran but no ground command has been heard since -> re-burn every BURN_REBURN_AFTER_S
+        Stops once the ground is heard, or after BURN_MAX_TOTAL burns this boot.
+        """
+        if self.last_ground_contact is not None or self.burn_total >= self.BURN_MAX_TOTAL:
+            return  # ground heard (antenna works) or burned enough already
+        if self.deployed:
+            # after a reboot there's no last burn time; count from boot
+            ref = self._last_burn_time if self._last_burn_time is not None else 0.0
+            wait = self.BURN_REBURN_AFTER_S
+        else:
+            if self._last_burn_time is None:
+                return  # the first attempt is DEPLOY's job
+            ref = self._last_burn_time
+            wait = self.BURN_RETRY_BACKOFF_S
+        if self.mission_time - ref < wait:
+            return
+        try:
+            if cubesat.battery_voltage < self.BAT_THRESH_SCIENCE:
+                return  # don't burn on a weak battery; try again next check
+        except Exception:
+            return
+        print(f"[WATCHDOG] No antenna confirmation; re-firing burn wire (burn #{self.burn_total + 1}).")
+        self._task_activate_burn_wire()
+
+    def _remove_task(self, name):
+        self.tasks = [t for t in self.tasks if t.name != name]
 
     def _task_init_sd_card(self):
         try:
-            self.log_file = cubesat.new_file("/data/mission", binary=False)
+            log_file = cubesat.new_file("/data/mission", binary=False)
+            if log_file is None:  # new_file returns None if there's no SD card / can't make the dir
+                raise RuntimeError("new_file returned None (no SD card?)")
+            self.log_file = log_file
             self.sd_card_initialized = True
             self.equipment_check["sd_card"] = True
             print(f"[DEPLOY] SD card ready: {self.log_file}")
@@ -312,14 +561,92 @@ class QubeSatFSM:
             with open(self.log_file, "a") as f:
                 f.write(f"{self.mission_time:.1f},{self.latest_data}\n")
             print(f"[DATA] Recorded at t={self.mission_time:.1f}s")
+            self.latest_data = None  # don't write the same sample twice
         except Exception as e:
             print("[DATA] Record error:", e)
 
     def _task_beacon(self):
-        pass
+        """Queue a TinyGS-format beacon (Comms.build_beacon_packet) for the next TX window."""
+        try:
+            vbatt = cubesat.battery_voltage
+        except Exception:
+            vbatt = 0.0
+        temp = _temperature_c()
+        pkt = build_beacon_packet(
+            self.state, vbatt, temp if temp is not None else 0.0, self.mission_time
+        )
+        if self.comms is None:
+            print("[BEACON] (no comms attached)", pkt)
+        elif not self.comms.push_telemetry(pkt):
+            print("[BEACON] Telemetry queue full, beacon dropped.")
 
+    # ---- transition logic ----
+    # Low battery -> IDLE is handled by _task_battery_check (<= low_level_threshold).
+    # Everything else lives here.
+    #
+    #   IDLE    -> DEPLOY          not deployed, idle for DEPLOY_AFTER_IDLE_S, battery ok, burn wire not given up
+    #   IDLE    -> SCIENCE/COMMS   already deployed and battery >= BAT_THRESH_SCIENCE
+    #   DEPLOY  -> SCIENCE/COMMS   burn wire done, SD ready, battery ok (sends handshake)
+    #   DEPLOY  -> IDLE            battery low, or burn wire gave up
+    #   SCIENCE <-> COMMS          re-rolled every STATE_DWELL_S using the mission-time weighting
     def _task_transition_check(self):
-        pass
+        if self.locked:
+            return  # ground has locked the state
+        try:
+            vbatt = cubesat.battery_voltage
+        except Exception as e:
+            print("[TRANSITION] Can't read battery:", e)
+            return
+        battery_ok = vbatt >= self.BAT_THRESH_SCIENCE
+
+        if self.state == StateID.IDLE:
+            if not battery_ok:
+                return
+            if self.deployed:
+                self.transition(self._choose_science_or_comms())
+            elif (
+                self.mission_time >= self.DEPLOY_AFTER_IDLE_S
+                and self.burn_attempts < self.BURN_MAX_ATTEMPTS
+            ):
+                self.transition(StateID.DEPLOY)
+
+        elif self.state == StateID.DEPLOY:
+            if not battery_ok:
+                self.transition(StateID.IDLE)
+            elif self.deployed and self._check_equipment_functional():
+                self._send_handshake()
+                self.transition(self._choose_science_or_comms())
+            elif not self.deployed and self.burn_attempts >= self.BURN_MAX_ATTEMPTS:
+                print("[TRANSITION] Burn wire failed -> IDLE")
+                self.transition(StateID.IDLE)
+            # otherwise: still waiting on burn wire / SD card, stay in DEPLOY
+
+        elif self.state in (StateID.SCIENCE, StateID.COMMS):
+            if self.mission_time - self._state_entered_at >= self.STATE_DWELL_S:
+                self._state_entered_at = self.mission_time  # restart dwell even if same state
+                self.transition(self._choose_science_or_comms())
+
+    def _check_equipment_functional(self):
+        """Deploy-time check. Payload and solar panels are checked by their own states."""
+        return bool(
+            self.equipment_check["sd_card"] and self.equipment_check["burn_wire"]
+        )
+
+    def _choose_science_or_comms(self):
+        """P(science) falls linearly from SCIENCE_WEIGHT_MAX to _MIN over MISSION_EOL_S."""
+        t = min(self.mission_time, self.MISSION_EOL_S)
+        span = self.SCIENCE_WEIGHT_MAX - self.SCIENCE_WEIGHT_MIN
+        science_weight = self.SCIENCE_WEIGHT_MAX - span * (t / self.MISSION_EOL_S)
+        chosen = StateID.SCIENCE if random.random() < science_weight else StateID.COMMS
+        print(f"[TRANSITION] science_weight={science_weight:.2f} -> {StateID.name(chosen)}")
+        return chosen
+
+    def _send_handshake(self):
+        """Tell the ground that deploy finished. Placeholder packet format."""
+        msg = f"HANDSHAKE,DEPLOY_COMPLETE,t={self.mission_time:.0f}".encode()
+        print("[DEPLOY]", msg)
+        if self.comms:
+            self.comms.push_telemetry(msg)
 
     def _task_init_payload(self):
         """Pings the ESP32 quantum diamond payload board and verifies link."""
@@ -368,15 +695,19 @@ class QubeSatFSM:
 
     def run(self):
         print("[FSM] Starting mission.")
+        self._start_time = time.monotonic()
         while True:
             try:
                 now = time.monotonic()
-                self.mission_time = now
+                self.mission_time = now - self._start_time
 
-                # run any tasks that are due
-                for task in self.tasks:
+                # run any tasks that are due, highest priority (lowest number) first
+                task_list = self.tasks
+                for task in sorted(task_list, key=lambda t: t.priority):
                     if task.is_due(now):
                         task.run()
+                        if self.tasks is not task_list:
+                            break  # a task changed state; start over with the new list
 
                 # tick comms every loop iteration (handles RX/TX scheduling)
                 if self.comms:

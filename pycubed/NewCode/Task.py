@@ -4,35 +4,47 @@ import time
 
 
 class Task:
+    """
+    name           : human-readable label
+    priority       : lower number = higher priority (1 is highest)
+    period         : seconds between runs; None = one-shot (runs once, then never again)
+    schedule_later : False -> first run happens right away (after `delay`)
+                     True  -> first run waits one full `period` (after `delay`)
+    func           : the callable that does the work
+    delay          : extra seconds to wait before the first run (e.g. 30 min burn wire)
+    """
 
-    # each class should have a name (String)
-    # priority (int) that numerically quantifies/can be sorted to determine order relative to another
-    # the perod = amount of time needed to wait before task is execued
-    # schedule_later (boolean) determines if task needs to be executed now or later
-    # func is the method it calls for action to be executed
-
-    def __init__(self, name, priority, period, schedule_later, func):
+    def __init__(self, name, priority, period, schedule_later, func, delay=0.0):
         self.name = name
         self.priority = priority
         self.period = period
         self.schedule_later = schedule_later
         self.func = func
-        self.last_run_time = None  # in seconds, last_run_time represents the last time it was run, should be None at the beginning
-
-        # this method determines if the function for the task needs to be run right now
-        # if last_run_time is None (task has never been run before) -> should run it
-        # otherwise -> see how much current time - last run time is (if it's more than period -> should run again)
+        self.delay = delay
+        self.last_run_time = None  # None until the task has run once
+        self.done = False  # True once a one-shot task has run
+        self._ready_at = None  # time of first run, fixed the first time is_due is called
 
     def is_due(self, now: float) -> bool:
+        if self.done:
+            return False
+
         if self.last_run_time is None:
-            return (
-                not self.schedule_later
-            )  # if schedule_later=True, don't run immediately
-        return (
-            now - self.last_run_time
-        ) >= self.period  # was self.period_s, wrong name
+            if self._ready_at is None:
+                self._ready_at = now + self.delay
+                if self.schedule_later and self.period is not None:
+                    self._ready_at += self.period
+            return now >= self._ready_at
+
+        if self.period is None:
+            return False
+        return (now - self.last_run_time) >= self.period
 
     def run(self):
-        result = self.func()
-        self.last_run_time = time.monotonic()
-        return result
+        try:
+            return self.func()
+        finally:
+            # set even if func raises, so a failing task doesn't spin every loop
+            self.last_run_time = time.monotonic()
+            if self.period is None:
+                self.done = True

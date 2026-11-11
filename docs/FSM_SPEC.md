@@ -1,0 +1,368 @@
+Authored by Claude based on current state of flight software. If the majority of these cannot be answered definitively, my tasks cannot progress and the entire project is likely to fail.
+
+# QubeSat Flight Software: FSM Spec (DRAFT, needs sign-off)
+
+**Status:** DRAFT. Written from the code as it stands, the original `Qubesat FSM Definition.pdf`,
+the board backup of `Comms.py`, and the payload ICD. **No part of this has been approved by the team.**
+**Owner of this document / FSM code:** Prajwal Agrawal
+
+## Why this exists
+
+There was no written spec for how the satellite should behave. The FSM code was inherited with no
+documentation (last upstream commit ~6 months before this copy was made), and the only design
+document, `Qubesat FSM Definition.pdf`, is a sketch with most priorities/periods blank and sections
+that contradict each other. Every number in the code is therefore either from that PDF or was
+chosen by the implementer. This doc lists them all so they can be confirmed or changed.
+
+## How to use this document
+
+Part 7 lists every open question, with the 11 core questions first (7.0). **No answers are
+proposed.** The "Context" column only explains why the software needs the answer, or what the current
+code does, so you know what is being asked about; it is not a recommendation and nobody has agreed to
+it. Please write the decision in the **Answer** column. If the decision belongs to someone else,
+write who.
+
+For each question, start the Answer with one of these so we can tell the cases apart:
+
+- **ANSWERED**: the decision, plus a link if it is documented somewhere.
+- **NOT DECIDED**: nobody has decided yet. Say who should decide, and by when.
+- **DON'T KNOW**: someone knows, but not me. Say who.
+
+Priority: **B** = blocker (the code cannot be finalized or flown without an answer), **S** = should
+be answered before flight, **N** = nice to have.
+
+### Labels used below
+
+| Label             | Meaning                                              |
+| ----------------- | ---------------------------------------------------- |
+| **DECIDED** | A person with authority chose this; source is named. |
+| **ASSUMED** | The implementer picked it. Needs sign-off.           |
+| **UNKNOWN** | Nobody has said. The code contains a placeholder.    |
+
+---
+
+## What exists today
+
+This project is not starting from scratch. The pieces below exist; what is missing is mostly the
+connections between them and testing on the real board. "Status" says how each piece was checked.
+
+| Component | What it does | Status |
+| --- | --- | --- |
+| Payload firmware (`payload/src`, ESP32) and ICD docs | ODMR sweep, photodiode, RTDs, rails, heaters, diagnostics, UART command interface | **Tested and working** (reported by Prajwal) |
+| `PayloadUART.py` | Board-side driver for the payload: ping, photodiode, RTDs, contrast at a frequency, rails on/off, heaters on/off, status | **Tested and working** (reported by Prajwal). `test_payload.py` exists but needs the board |
+| Board library (`lib/pycubed.py` and drivers) | Stock PyCubed drivers: radio, IMU, power monitor, charger, SD, NVM | Stock library; the board runs it |
+| `Comms.py` (board backup version) | Radio config for TinyGS, beacon packet, AES command parser, RX/TX scheduling, NVM-saved config | Copied from the backup of the actual board. Lock bit, dedup and callback changes were added on top and are **desktop-tested only** |
+| `Task.py` + `QubeSatFSM.py` | Task scheduler and the four-state machine: boot into IDLE, timed DEPLOY, burn-wire retries, SCIENCE/COMMS selection, ground state commands with lock, safety overrides, crash recovery, status packet | **Desktop-tested only** (`test_fsm.py`, 21 tests, stubbed hardware, fake clock). Never run on the board |
+| `BurnWire.py` | Burn-wire driver (ramp, hold, release) | Driver exists. The FSM's call to it is probably wrong (§6). Not known to have been fired on real hardware |
+| This spec | Every behavior and every number in the code, with open questions | Draft, unapproved |
+
+**Not built yet:** the entry point that starts the FSM on the board; any downlink of science data;
+the ground-station software; replay protection for commands; persistence of the lock and mission time
+across reboots; on-hardware testing of anything above the payload driver.
+
+---
+
+## 1. Overview
+
+Four states. The satellite **boots into IDLE**, deploys its antenna after a wait, then alternates
+between SCIENCE and COMMS. Comms (radio RX/TX) runs on its own schedule in **every** state; the
+COMMS *state* is not what enables the radio.
+
+| Code | State   | Purpose                                                                              |
+| ---- | ------- | ------------------------------------------------------------------------------------ |
+| 0    | STOP    | Not an FSM state. A Comms command: stop transmitting (still listens).                |
+| 1    | IDLE    | Low-power holding state. Beacon + battery check. Entered at boot and on low battery. |
+| 2    | DEPLOY  | Initialize SD card, fire burn wire (antenna release), then handshake.                |
+| 3    | SCIENCE | Run the payload experiment and log data.                                             |
+| 4    | COMMS   | Check solar charging, beacon. (The PDF intends "downlink window"; see Q-C1.)         |
+
+State codes are the same in `StateCodeGenerator.py` and `Comms.py` (a test enforces this).
+Source for numbering: board backup `Comms.py` (**DECIDED**, as it is what runs on the board).
+
+## 2. Transitions
+
+| From             | To                                                                                 | Condition                                                                              | Status                                       |
+| ---------------- | ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- | -------------------------------------------- |
+| boot             | IDLE                                                                               | always                                                                                 | DECIDED (Prajwal)                            |
+| IDLE             | DEPLOY                                                                             | not yet deployed AND mission time ≥ 60 min AND battery ≥ 8.0 V AND < 3 burn attempts | ASSUMED (60 min: Prajwal; rest: implementer) |
+| IDLE             | SCIENCE/COMMS                                                                      | already deployed AND battery ≥ 8.0 V                                                  | ASSUMED                                      |
+| DEPLOY           | SCIENCE/COMMS                                                                      | burn ran, SD card OK, battery ≥ 8.0 V (sends handshake)                               | ASSUMED (PDF: "if b AND c AND d")            |
+| DEPLOY           | IDLE                                                                               | battery < 8.0 V, or 3 burn attempts failed                                             | ASSUMED                                      |
+| SCIENCE ↔ COMMS | re-rolled at most every 10 min; P(science) falls linearly 100% → 10% over 90 days | PDF (weights/EOL); 10 min dwell is ASSUMED                                             | ASSUMED                                      |
+| any              | IDLE                                                                               | battery ≤ 6.0 V, or temperature > 60 °C ("safety")                                   | PDF (low power → idle); thresholds ASSUMED  |
+| any              | any                                                                                | ground command (see §4)                                                               | ASSUMED                                      |
+
+## 3. Tasks per state (exactly as in the code)
+
+Lower priority number runs first. `schedule_later=True` means the first run waits one full period.
+
+**IDLE**
+
+| Pri | Task             | Period | Later? |
+| --- | ---------------- | ------ | ------ |
+| 1   | Beacon           | 30 min | no     |
+| 2   | Battery Check    | 60 s   | yes    |
+| 3   | Transition Check | 10 s   | yes    |
+| 4   | Antenna Watchdog | 10 min | yes    |
+
+**DEPLOY**
+
+| Pri | Task             | Period                                       | Later? |
+| --- | ---------------- | -------------------------------------------- | ------ |
+| 1   | SD_Card init     | one-shot                                     | no     |
+| 2   | Burn Wire        | retry every 60 s until success or 3 attempts | no     |
+| 3   | Battery Check    | 60 s                                         | yes    |
+| 4   | Beacon           | 30 min                                       | yes    |
+| 5   | Transition Check | 10 s                                         | yes    |
+
+**SCIENCE**
+
+| Pri | Task                                     | Period   | Later? |
+| --- | ---------------------------------------- | -------- | ------ |
+| 1   | Initialize Payload (ping ESP32)          | one-shot | no     |
+| 2   | Battery Check                            | 60 s     | yes    |
+| 3   | Receive Data (1 ODMR point + photodiode) | 10 s     | yes    |
+| 4   | Record to Memory (SD)                    | 10 s     | yes    |
+| 5   | Transition Check                         | 10 s     | yes    |
+| 6   | Antenna Watchdog                         | 10 min   | yes    |
+
+**COMMS**
+
+| Pri | Task              | Period | Later? |
+| --- | ----------------- | ------ | ------ |
+| 1   | Solar Panel Check | 60 s   | no     |
+| 2   | Battery Check     | 60 s   | yes    |
+| 3   | Beacon            | 30 min | yes    |
+| 4   | Transition Check  | 10 s   | yes    |
+| 5   | Antenna Watchdog  | 10 min | yes    |
+
+The PDF has two conflicting descriptions. Its task list fills in only the idle Beacon (priority 1,
+30 min, not later); every other priority/period there is blank. Its sample code is a different
+design that uses other values (battery check every 5 min, transition check every 60 s, record flush
+every 30 min, data-packet send every 60 s). The code here follows neither exactly, so apart from
+the idle Beacon, all periods/priorities are **ASSUMED**. Q-X4 asks which set to use.
+
+## 4. Ground interface (Comms)
+
+Radio: 433.0 MHz LoRa, BW 125 kHz, SF7, CR 4/5, sync word 0x12, 5 dBm. Source: board backup
+`Comms.py`, configured for TinyGS. **DECIDED** (by whoever tuned the board), but see Q-C2 on licensing.
+
+Uplink commands: AES-128-ECB encrypted, CRC-8 + complement check.
+
+| Command                                             | Effect                                                                                                                                                                                                                    |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SET_STATE(state, lock)`                          | Go to `state`. `lock=1`: FSM transition logic frozen until a command with `lock=0` (or a safety override clears it). `lock=0`: go there, then autonomous transitions resume. The lock is bit 7 of the state byte. |
+| `SET_STATE(STOP)`                                 | Comms stops transmitting (keeps listening). FSM state unchanged. Any non-zero state resumes.                                                                                                                              |
+| `SET_CONFIG(rx_ticks, tx_packets, telem_cadence)` | Change the RX/TX schedule (persisted in NVM).                                                                                                                                                                             |
+
+Identical state commands within 60 s are applied once (ground may repeat for reliability).
+Commanding DEPLOY re-arms the burn wire even if it previously gave up.
+
+Downlink: (a) **beacon** every 30 min in TinyGS format (15 bytes: callsign, state, battery mV, temp,
+mission time, CRC-8); (b) **internal status** packet (13 bytes, first byte `0x01`: state, lock,
+deployed/equipment flags, burn attempts, battery, temp, mission time, crash count) every
+`telem_cadence` TX windows. **Science data is not downlinked yet.**
+
+## 5. Safety and failure behavior (as implemented)
+
+- **Low battery / overheat → IDLE**, even if the ground locked the state. The lock is cleared when
+  this happens. (Switch: `LOW_BATTERY_OVERRIDES_LOCK`.)
+- **Antenna watchdog.** There is no sensor that says the antenna deployed, and if it didn't the
+  ground probably cannot reach us. So: if a burn raised an error, retry every 1 h forever; if a burn
+  ran but no ground command has been heard since, re-burn every 12 h, up to 10 burns per boot; stop
+  once any ground command is received after a burn. No burn is attempted below 8.0 V.
+- **"Deployed" flag** is stored in NVM byte 19 so a reboot does not re-fire the burn wire.
+- **SD card failure:** DEPLOY waits (does not proceed without SD). Science records are skipped if SD is not ready.
+- **Crash:** `run()` catches errors, increments `c_state_err`, waits 10 s and resets.
+- **Mission time resets on every reboot**, which also restarts the science/comms weighting.
+
+## 6. Known problems (not spec questions, just bugs/risks)
+
+1. **Burn wire call is probably wrong.** FSM calls `cubesatBurn("1", 0.25, 30)` intending 25% duty,
+   30 s. `BurnWire` treats the duty cycle as a percent (so 0.25 → 0.25%) and ignores `duration`
+   (always ~350 s, blocking the FSM and radio the whole time). This could mean the antenna never
+   deploys. **Needs hardware owner's input (Q-D1).**
+2. **No entry point:** nothing runs `QubeSatFSM().run()` yet.
+3. Placeholders: callsign `"STAC  "`, AES key all zeros.
+4. Not run on real hardware. Desktop tests: `pycubed/NewCode/test_fsm.py` (stubs, fake clock).
+
+---
+
+## 7. Open questions
+
+Part 7 is split into sections, so the important questions are not buried:
+
+- **7.0 Core questions.** The 11 that everything else depends on. If these cannot be answered, the
+  rest of the document cannot be answered either. Please start here.
+- **7.1 System-level questions.** Things this spec did not cover because they are not about the FSM:
+  getting data to the ground, the ground software, surviving faults, and testing on hardware.
+- **7.2 Follow-up questions.** Answer these after 7.0. Many will be easy once the core is settled.
+- **7.3 FSM decisions (Prajwal).** Implementation choices inside the FSM and payload code. They are
+  listed so the team can see them and object, not because anyone else has to decide them.
+- **7.4 Already answered.** Kept so the record is in one place.
+
+Answers can be short or can point at an existing document.
+
+### 7.0 Core questions
+
+
+| # | Pri | Question | Context (why the software needs it, or what the code does today) | Answer |
+| --- | --- | --- | --- | --- |
+| Q-H2 | B | **What does mission success look like?** What is the minimum result that counts as success, and what counts as full success? By when? | Decides what the FSM must guarantee, what data must reach the ground, and what can be dropped. |  |
+| Q-H3 | B | **What is the intended operating loop?** Walk through a typical day or a typical orbit: when does the satellite charge, run the experiment, talk to the ground, and what is the ground team doing at each step? | The FSM is a guess at this loop. Today it is "idle, deploy once, then randomly alternate science and comms, weighted by mission time". Nobody has said whether that matches the intent. |  |
+| Q-H4 | B | **What is a science experiment, end to end?** What is measured, with what procedure, for how long, what data does it produce, how is that data analyzed, and what counts as a good result? | The code runs one ODMR point every 10 s. Whether that is an experiment at all is not defined anywhere. |  |
+| Q-H5 | B | **What must be true for the experiment to work?** (e.g. temperature stability and settling time of the diamond, laser and rail power, magnetic environment, orientation or pointing, how long the satellite must stay in a given mode.) | These are the conditions the FSM would have to create and monitor. The code checks none of them. |  |
+| Q-H8 | B | **Who decides when science runs: the satellite autonomously, or the ground?** How much autonomy is intended versus ground control? | The current design is almost fully autonomous with a manual override. A ground-scheduled design would look very different. |  |
+| Q-D1 | B | What are the correct burn-wire **duty cycle** and **burn duration** for our nichrome and battery? | FSM calls `cubesatBurn("1", 0.25, 30)` intending "25%, 30 s". `BurnWire` divides the duty by 100 (so 0.25 means 0.25%) and ignores `duration`, always ramping for ~50 s then holding ~300 s. |  |
+| Q-D2 | B | What does the burn wire release: the antenna only, or the solar panels too? (PDF says antennas; a code comment says panels.) | After a burn it sets `solar_panels_on = True`, but never checks anything about panels. |  |
+| Q-P1 | B | What are the correct battery voltages for the pack (cell count, chemistry): the cutoff for going to IDLE, and the voltage needed to leave IDLE? | Goes to IDLE at 6.0 V or below. Leaves IDLE at 8.0 V or above. `high_level_threshold = 8.4` is defined but unused. The PDF only says "low/high threshold". |  |
+| Q-C2 | B | What is the licensed frequency and the real callsign? | 433.0 MHz and placeholder callsign `"STAC  "`. |  |
+| Q-C3 | B | What is the real AES key, and how is it stored and shared? | 16 zero bytes. |  |
+| Q-C4 | S | What exactly must be downlinked, and how often? The PDF lists payload data, whether the experiment went right, battery, temperature, time since deployment. | Beacon every 30 min (TinyGS format: callsign, state, battery, temp, mission time). A second 13-byte internal-status packet every 3rd TX window. No science data and no "experiment succeeded" flag is sent. |  |
+
+
+### 7.1 System-level questions
+
+These are about the whole system, not the FSM. Pri B = the mission cannot work without an answer.
+
+#### Data path and ground segment
+
+| # | Pri | Question | Context (what exists today) | Answer |
+| --- | --- | --- | --- | --- |
+| Q-G1 | B | **What is the end-to-end path of one science measurement?** From the payload, to storage, to a downlink packet, to the ground, to the person analyzing it. Who owns each step? | Payload read, then one text line on the SD card. Nothing after that: no selection, packetizing, downlink or ground step exists. | |
+| Q-G2 | B | **Who builds and runs the ground-station software?** Receiving, decoding, building and sending commands, storing data. What is it written in and where does it live? | The repo has no ground-station tool. `Comms.py` contains the encrypt function the ground would use, and `pc-backup/receive.py` is a receive script for the board side. Neither is a ground tool. | |
+| Q-G3 | S | **How is science data framed for the radio?** Packet size, splitting data over several packets, acknowledgements, and what happens when packets are lost. | None. Beacon and status packets are single short packets. | |
+| Q-G4 | S | **Is the team using its own ground station, the TinyGS network, or both?** | Beacon is in TinyGS format. Nobody has said whether TinyGS is the intended receive path. | |
+| Q-G5 | S | **Is protection against replayed commands required?** | Commands are AES-128-ECB with a CRC and no counter or nonce, so a recorded valid command can be replayed. The 60 s dedup window is for repeated sends, not security. | |
+
+#### Faults and reliability
+
+| # | Pri | Question | Context (what exists today) | Answer |
+| --- | --- | --- | --- | --- |
+| Q-R1 | B | **Which failures must the satellite survive with no help from the ground, and how?** For example: payload hangs, SD card fails or fills, radio fails, the FSM loop gets stuck, repeated resets. | Handled: burn error, low battery, overheat, FSM crash (reset). Not handled: payload hang beyond a log line, SD full (no free-space check), radio failure, stuck loop. | |
+| Q-R2 | S | **What happens when the SD card is full or corrupt?** Stop science, overwrite old data, or something else? | Appends to new `/data/mission*.txt` files; no free-space check or file rotation. | |
+| Q-R3 | S | **Is the hardware watchdog used?** What should it do on a hang, including during the long burn-wire hold? | Not used by the FSM. | |
+
+#### Testing and verification
+
+| # | Pri | Question | Context (what exists today) | Answer |
+| --- | --- | --- | --- | --- |
+| Q-V1 | B | **What is the plan for first on-hardware tests, and who runs them?** For example: boot the FSM on the board, receive a command over the radio, fire the burn wire into a dummy load, run the science loop with the real payload. Which board and when? | Nothing above the payload driver has run on the board. | |
+| Q-V2 | S | **Can the full loop be tested before flight?** Command from a ground tool, FSM state change, telemetry received back. | Not possible yet: no ground tool (Q-G2) and no entry point (Q-X1). | |
+| Q-V3 | S | **How long must the FSM run on the board without a reset before it counts as stable?** | The desktop tests cannot show memory use or long-run stability on CircuitPython. | |
+
+### 7.2 Follow-up questions
+
+Answer after 7.0. Statuses as above (ANSWERED / NOT DECIDED / DON'T KNOW). A few already have notes from Prajwal.
+
+
+#### Mission and project
+
+| # | Pri | Question | Context (why the software needs it, or what the code does today) | Answer |
+| --- | --- | --- | --- | --- |
+| Q-H6 | S | **Does the experiment need attitude knowledge or control?** Is there any pointing requirement, and is the IMU data needed to interpret the measurements? | Decides whether IMU data must be recorded alongside science data. |  |
+| Q-H7 | S | **How much science is enough?** How many runs or how many hours of data does the mission need, and how much of that has to reach the ground? | Sets storage and downlink requirements. Today no science data is downlinked. |  |
+| Q-H9 | S | **Is a four-state machine (IDLE / DEPLOY / SCIENCE / COMMS) the intended architecture?** Is it the original designers' choice, and is it still the plan, or should it be scheduled sequences, command-driven modes, or something else? | The whole code base is built on it. It came from the PDF, whose source and date are unknown. |  |
+| Q-H10 | S | **What are the system budgets?** Orbit-average power, thermal limits, and the radio link budget (data rate, passes per day, pass length). | The FSM's thresholds, periods, and what can be transmitted all depend on these. None are written down. |  |
+| Q-H11 | S | **What are the launch and regulatory requirements?** Deployment-switch and wait-time rules from the launch provider, frequency licensing or coordination, orbit and lifetime assumptions. | Sets the deploy delay, when radio transmission is allowed, and the callsign and frequency. |  |
+| Q-H16 | S | **Where is the current source of truth for the design and requirements?** The code was last updated about 6 months before the copy used here. Was the previous design kept, replaced, or abandoned, and where is the replacement written down? | We are reconstructing intent from code and a sketch. If a newer design exists, this document may be wrong. |  |
+
+
+#### Mission and timeline
+
+| # | Pri | Question | Context (why the software needs it, or what the code does today) | Answer |
+| --- | --- | --- | --- | --- |
+| Q-M1 | B | The original PDF literally says "30 minutes after ____ (launch? stable orbit? system start/boot?) deploy antennas". **What event starts the deploy clock, and how long is the wait?** Does the launch provider/deployer require a specific wait before anything is released? | Starts at FSM boot; waits 60 min in IDLE, then goes to DEPLOY. (The 60 min came from Prajwal as a placeholder.) |  |
+| Q-M2 | S | Mission length, and what should happen at end of life? | Science/comms weighting is computed over 90 days; after that it stays at its minimum. Nothing else happens at 90 days. |  |
+| Q-M3 | S | "Time since deployment" is listed as telemetry in the PDF. Should mission time count from boot, from the burn-wire firing, or from launch? Should it survive reboots? | Counts seconds since the FSM started running; resets to 0 on every reboot (which also restarts the science/comms weighting). Nothing records when deployment happened. |  |
+| Q-M4 | S | When are ground passes, who operates the ground station, and how many passes per day do we expect? | Not known to the code. Beacon is every 30 min and the antenna re-burn wait is 12 h; both are placeholders. |  |
+
+
+#### Deployment and antenna
+
+| # | Pri | Question | Context (why the software needs it, or what the code does today) | Answer |
+| --- | --- | --- | --- | --- |
+| Q-D3 | S | Is burn wire 2 a redundant release for the same mechanism, or a different mechanism? | Only wire 1 is ever used. |  |
+| Q-D4 | S | Is there any way to confirm the antenna deployed (switch, loopback, signal check)? | None. A burn that finishes without an error counts as success. |  |
+| Q-D5 | S | What should the retry policy be if the burn fails, or if no ground contact is ever made? How many burns are acceptable given battery and heat limits? | 3 attempts on entering DEPLOY, then back to IDLE. Then a watchdog retries hourly after errors, and re-burns every 12 h if the ground is never heard, up to 10 successful burns per boot. Stops once any ground command is received after a burn. |  |
+| Q-D7 | S | The burn blocks the whole FSM, including the radio, for about 6 minutes. Is that acceptable? Is there a hardware watchdog that would reset it during that time? | The burn blocks; nothing else runs and no radio RX happens meanwhile. |  |
+
+
+#### Power and thermal
+
+| # | Pri | Question | Context (why the software needs it, or what the code does today) | Answer |
+| --- | --- | --- | --- | --- |
+| Q-P2 | S | The board has no battery or CPU temperature sensor, only the IMU's. Is the IMU temperature acceptable for the overheat check, or should it use another sensor (e.g. the payload's RTDs)? What is the maximum safe temperature? | Uses the IMU temperature, and forces IDLE above 60 °C. If the IMU gives no reading it treats it as safe. |  |
+| Q-P4 | S | The PDF says battery heaters and battery sensors "constantly running in background". Who controls them, and does the FSM need to? | The FSM does nothing about heaters. | UNSURE<br>The payload may be responsible for heaters, but currently there is no code to run them. |
+| Q-P5 | S | Power budget per state (radio TX and RX, payload 5 V and 10 V rails). Which states may transmit, receive, or power the payload? | Radio RX/TX runs in every state. The FSM never switches the payload rails. | UNSURE<br>THe payload has functions to switch power rails as needed, but the experiment procedure was not specified. |
+| Q-P6 | S | The PDF's COMMS state says "turn on solar panels". The code treats panels as hardware-enabled and only checks whether they are charging. Is that right? | Reads `solar_charging` / `charge_current` and records whether it is charging. Does not switch anything. |  |
+
+
+#### Science and payload
+
+| # | Pri | Question | Context (why the software needs it, or what the code does today) | Answer |
+| --- | --- | --- | --- | --- |
+| Q-S1 | B | What is one "science run"? One ODMR point at a time forever, or a full sweep? How long does it run, and what counts as a successful result ("see if experiment went right")? | One ODMR point plus photodiode reading every 10 s, stepping 2800→2950 MHz by 1 MHz and wrapping. A full sweep is at least ~25 min (each point can block up to 30 s on a timeout). No success criterion exists. | UNSURE<br>This is an assumption. Again, the experiment procedure was not specified anywhere. |
+| Q-S2 | S | Should the FSM power the payload rails and run heaters when entering or leaving SCIENCE? | It doesn't. It only pings the payload and reads data. |  |
+| Q-S3 | S | What should be recorded per sample, in what file format, and what is the storage budget? | One text line per sample: mission time, frequency, contrast, photodiode, appended to `/data/mission*.txt`. |  |
+| Q-S4 | S | The PDF's SCIENCE state records timestamped IMU readings. Is IMU data also required? | The code does not record the IMU. |  |
+| Q-S6 | S | How should SCIENCE and COMMS share time? (The PDF says "decrease science and increase comms over time" and a random draw.) | P(science) falls linearly from 100% to 10% over 90 days. A random draw picks the state, re-rolled at most every 10 min. |  |
+| Q-S7 | S | What does "equipment functional" mean, and which self-tests count? (The PDF asks "how does this get checked thru code??") | At deploy it checks only SD card and burn wire. The PDF's sample code also checks IMU and radio. Payload is pinged only when SCIENCE starts. Solar is checked only in COMMS. |  |
+
+
+#### Comms and ground
+
+| # | Pri | Question | Context (why the software needs it, or what the code does today) | Answer |
+| --- | --- | --- | --- | --- |
+| Q-C1 | S | What should the COMMS *state* do? The PDF says: turn on panels, check power, send stored data packets. | Solar check, beacon, battery check. It does not send data packets, and the radio runs in every state, so the state doesn't enable anything. |  |
+| Q-C5 | S | **Which manual overrides must the ground have?** (The PDF mentions "command to instantly switch to certain states" and a command that stops the satellite from giving or receiving until a new command.) | Three commands: set state (with optional lock), STOP, and set the RX/TX schedule. Nothing for: force a burn, change thresholds, run a task now, reset the FSM, clear crash count. |  |
+| Q-C6 | S | **What internal state must be visible from the ground, and in which packet?** | The 13-byte status packet shows state, lock, deployed and equipment flags, burn attempts, battery, temperature, mission time, crash count. It does not show task status, last error, SD status detail, or payload data. |  |
+| Q-C8 | S | The PDF says the stop command halts the satellite "giving **or receiving**" data. Should STOP also stop receiving? (If it did, the ground could not wake it with another command.) | STOP stops transmitting only. It keeps listening so a new command can wake it. |  |
+| Q-C9 | S | The PDF's idle diagram has "check in position to send signal". Should transmissions depend on the satellite's position or a ground-station window? Does the board have a position source? | No. It transmits on its own schedule regardless of position. |  |
+| Q-C11 | N | Which beacon/telemetry format is canonical? The board backup has a TinyGS beacon; the FSM also sends its own status packet with a different layout. | Both are sent. They can be told apart by length and first byte. |  |
+| Q-C12 | S | The state numbering COMMS = 4 comes from the board backup. The repo's old `StateCodeGenerator.py` said DATA = 4 and COMMS = 5. Is a separate DATA state needed? Does the ground-station tool use the same numbers? | DATA state was removed. COMMS = 4. |  |
+| Q-C13 | S | The PDF's comms notes mention "a certain frequency for our own" and a "Sean cooman" protocol, but give no details. What do these refer to? | Not implemented. |  |
+
+
+#### Software structure and process
+
+| # | Pri | Question | Context (why the software needs it, or what the code does today) | Answer |
+| --- | --- | --- | --- | --- |
+| Q-X2 | S | Who owns each file (FSM, Comms, BurnWire, payload UART) and who must review changes to each? | Not defined. Comms was changed (lock bit, dedup change, callback now takes `(code, lock)`) by the FSM side without the Comms owner's review. | I (Prajwal) am willing to own FSM and payload UART code. I need more specifications regarding comms and overall flow before I can fully finish the flight software. |
+| Q-X8 | S | What are the acceptance criteria for "flight ready"? What test (flatsat, thermal-vac, radio range) must pass, who runs it, and when? | Only desktop tests with stubbed hardware (`test_fsm.py`). Nothing has run on the board. | IN PROGRESS<br>We are working on testing procedures, but we cannot complete them effectively if I don't have a spec ready to write flight code with. |
+| Q-X9 | S | Who maintains this spec after it is signed off, and where does it live? | This draft is in `docs/FSM_SPEC.md`, written by Prajwal from the code. | Prajwal will maintain this document in the repository for the flight code. However, Chandrark Muddana and Tyler Minjung Lee need to completel significant parts of this document. |
+
+
+### 7.3 FSM decisions (Prajwal)
+
+These sit inside the FSM and payload code Prajwal owns. They are listed for visibility. Prajwal
+fills in the **Decision** column; comment here if you disagree with a decision once it is filled in.
+
+
+| # | Pri | Question | Context (why the software needs it, or what the code does today) | Decision |
+| --- | --- | --- | --- | --- |
+| Q-C7 | S | Is "set state + lock" the intended override model? Should a locked state survive a reboot? | A lock freezes the autonomous state changes until unlocked. It is held in RAM only, so a reboot unlocks it silently. |  |
+| Q-C10 | S | Identical state commands within 60 s are treated as one (the ground repeats commands for reliability). Is 60 s right, and should the same command from the ground after that window be applied again? | Applied again if the same command arrives later than 60 s. |  |
+| Q-M5 | S | After a reboot, should the satellite resume its previous state (e.g. SCIENCE) or always start in IDLE? | Always starts in IDLE after a reboot. Comms saves a "state code" to NVM, but the FSM does not read it back. |  |
+| Q-P3 | S | Should a low battery override a ground lock on the state? | Yes: forces IDLE and clears the lock. (Switch: `LOW_BATTERY_OVERRIDES_LOCK`.) |  |
+| Q-S5 | S | What should happen when the payload doesn't answer? | Logs the failure and keeps running SCIENCE anyway; each read then reports an error. |  |
+| Q-X1 | B | **How does the FSM get started on the board?** Which file runs at boot, and does it replace the stock `state_machine` in `pycubed/build/main.py`? | Nothing starts it. No file in the repo runs `QubeSatFSM().run()`. | UNSURE<br>Other than the FSM, what else needs to be in the main startup file (main.py / code.py)? |
+| Q-X3 | S | Which code is the source of truth: `pycubed/NewCode` or the board? The Comms file here was replaced with the board backup version plus the lock bit. | Described above. |  |
+| Q-X4 | S | Which task periods should be used: this document's §3, or the PDF sample code's (battery check 5 min, transition check 60 s, record flush 30 min, data send 60 s)? | §3 values. |  |
+| Q-X5 | S | The board's own scripts import `lib.pycubed`; Comms imports `pycubed`. Importing under both names loads the library twice and creates two hardware objects. Which form is the standard here? | FSM, Comms and BurnWire all use `from pycubed import cubesat`. |  |
+| Q-X6 | S | Who allocates NVM bytes? The board library uses 0–16, Comms uses 20–26, and the FSM uses 19 for the "deployed" flag. | As described. No central map exists. |  |
+| Q-X7 | S | When the FSM crashes, `run()` waits 10 s and resets. Is that the desired recovery? Should repeated crashes change behavior (e.g. a safe mode)? | Waits 10 s, increments `c_state_err`, resets. |  |
+
+
+### 7.4 Already answered
+
+
+| # | Pri | Question | Context (why the software needs it, or what the code does today) | Answer |
+| --- | --- | --- | --- | --- |
+| Q-H1 | B | **What is the mission, in a paragraph?** What question does this satellite answer, and who receives the result? | Everything else (states, power, data) exists to serve this. The code has no statement of it. | DONE<br>We are trying to implement a new kind of NV-center diamond gyroscope. THis experiment was validated on the ground, but more interesting results could occur in space, and we want to understand its effectiveness for potential instrumentation applications. |
+| Q-H12 | S | **What is the schedule?** Launch date or milestones, and the date by which flight software must be finished. Which design reviews have taken place and where are their documents? | Decides what has to be finished, tested, and in what order. | See tasks sheet, DONE |
+| Q-H13 | S | **What hardware exists, and what state is it in?** Which subsystems are built and which are flight-like (a flatsat)? | Decides what the FSM can actually be tested against. Nothing has run on the board so far. | DONE |
+| Q-H14 | S | **Is there a confirmed launch opportunity?** | Whether and when this software will fly. | DONE |
+| Q-H15 | S | **Who is responsible for the satellite system as a whole?** Who owns requirements and resolves conflicts between subsystems (power, payload, comms, flight software)? | Many questions in this document need one person to decide, and today it is not clear who that is. | Chandrark Muddana, Prajwal Agrawal, Tyler Lee |
+| Q-D6 | S | **Can the radio receive from the ground with the antenna still stowed?** (This decides whether a ground override can ever help a failed deployment, or whether recovery must be fully autonomous.) | The watchdog assumes the ground may not be able to reach us. | DONE<br>The satellite cannot be contacted if the antenna was not deployed due to a failed burn wire. |
+
