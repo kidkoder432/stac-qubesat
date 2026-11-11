@@ -1,46 +1,50 @@
-# each state should have an assigned code to it, which should be the minimum number of bits
-# comms has no number since it's running in parallel
-# 0 is reserved for stopping all transmission
+# State codes shared by the FSM and Comms.
+#
+# Plain integer constants, no `enum` (CircuitPython has no enum module). These MUST match
+# the STATE_* constants in Comms.py (tests/test_fsm.py checks this).
+#
+# Each state has the minimum number of bits (3). 0 is reserved: STOP = halt all
+# transmission (Comms keeps listening so the ground can wake it with a non-zero state).
+# Comms is not a separate number; the COMMS *state* is the downlink / ground-contact window.
 
 
-import enum
+class StateID:
+    STOP = 0  # not an FSM state; a Comms command that halts transmission
+    IDLE = 1  # 0b001
+    DEPLOY = 2  # 0b010
+    SCIENCE = 3  # 0b011
+    COMMS = 4  # 0b100
 
-StateID = enum.IntEnum(
-    "StateID",
-    [
-        ("IDLE", 1),  # 001
-        ("DEPLOY", 2),  # 010
-        ("SCIENCE", 3),  # 011
-        ("DATA", 4),  # 100
-        ("COMMS", 5),  # 101
-    ],
-)
+    _NAMES = {0: "STOP", 1: "IDLE", 2: "DEPLOY", 3: "SCIENCE", 4: "COMMS"}
+
+    @classmethod
+    def name(cls, code):
+        return cls._NAMES.get(code, "UNKNOWN(%s)" % code)
+
+    @classmethod
+    def is_valid(cls, code):
+        return code in cls._NAMES
 
 
 class StateCodec:
-    STOP = 0  # reserved: halt all transmission
+    """Kept for compatibility with older code. Codes are now the state values themselves."""
 
-    _codes = {
-        StateID.IDLE: 0b001,
-        StateID.DEPLOY: 0b010,
-        StateID.SCIENCE: 0b011,
-        StateID.DATA: 0b100,
-        StateID.COMMS: 0b101,
-    }
-    _decode = {v: k for k, v in _codes.items()}
+    STOP = StateID.STOP
 
     @classmethod
     def encode(cls, state):
-        return cls._codes[state]
+        if not StateID.is_valid(state):
+            raise ValueError("Unknown state: " + str(state))
+        return state
 
     @classmethod
     def decode(cls, code):
         if code == cls.STOP:
             return None  # caller should halt transmission
-        if code not in cls._decode:
+        if not StateID.is_valid(code):
             raise ValueError("Unknown code: " + str(code))
-        return cls._decode[code]
+        return code
 
     @classmethod
     def is_valid(cls, code):
-        return code == cls.STOP or code in cls._decode
+        return StateID.is_valid(code)
