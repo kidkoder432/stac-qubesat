@@ -626,6 +626,86 @@ def test_telemetry_reports_sweep_progress_and_ground_contact():
     assert sweeps == 0 and point == f.current_sweep_freq - 2800 and point >= 10
 
 
+def test_lock_survives_reboot():
+    f, cm, radio = make()
+    cmd(radio, StateID.COMMS, lock=True)
+    step(f, cm, 1, 2)
+    clock[0] = 0.0
+    f2 = _reboot()
+    assert f2.locked and f2.state == StateID.COMMS
+    step(f2, None, 10, 400)
+    assert f2.state == StateID.COMMS, "the restored lock holds"
+
+
+def test_unlock_and_safety_override_clear_the_saved_lock():
+    f, cm, radio = make()
+    cmd(radio, StateID.SCIENCE, lock=True)
+    step(f, cm, 1, 2)
+    cmd(radio, StateID.SCIENCE, lock=False)
+    step(f, cm, 1, 2)
+    assert not _reboot().locked
+    cmd(radio, StateID.SCIENCE, lock=True)
+    step(f, cm, 1, 2)
+    cubesat.battery_voltage = 5.9
+    step(f, cm, 30, 3)
+    assert f.state == StateID.IDLE
+    cubesat.battery_voltage = 8.2
+    assert not _reboot().locked
+
+
+def test_locked_deploy_is_not_restored():
+    f, cm, radio = make()
+    cmd(radio, StateID.DEPLOY, lock=True)
+    step(f, cm, 1, 3)
+    assert f.locked and f.state == StateID.DEPLOY
+    n = len(burns)
+    clock[0] = 0.0
+    f2 = _reboot()
+    assert not f2.locked and f2.state == StateID.IDLE
+    step(f2, None, 10, 5)
+    assert len(burns) == n, "a reboot must not burn again because DEPLOY was locked"
+
+
+def test_a_deploy_lock_record_in_nvm_is_ignored_on_boot():
+    """Even if a DEPLOY lock somehow reaches NVM, boot must not restore it (it would burn again)."""
+    reset_world()
+    Q._save_lock(StateID.DEPLOY)
+    f = _reboot()
+    assert not f.locked and f.state == StateID.IDLE
+
+
+def test_torn_lock_record_is_ignored():
+    f, cm, radio = make()
+    cmd(radio, StateID.SCIENCE, lock=True)
+    step(f, cm, 1, 2)
+    Q._nvm[Q._NVM_LOCK + 2] ^= 0xFF
+    assert not _reboot().locked
+
+
+class _CountingNVM(bytearray):
+    writes = 0
+
+    def __setitem__(self, k, v):
+        _CountingNVM.writes += 1
+        super().__setitem__(k, v)
+
+
+def test_repeated_commands_do_not_rewrite_nvm():
+    f, cm, radio = make()
+    real = Q._nvm
+    Q._nvm = _CountingNVM(real)
+    try:
+        cmd(radio, StateID.SCIENCE, lock=True)
+        step(f, cm, 1, 2)
+        before = _CountingNVM.writes
+        with contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(10):
+                f.command_state(StateID.SCIENCE, True)
+        assert _CountingNVM.writes == before, "same lock again: no NVM writes"
+    finally:
+        Q._nvm = real
+
+
 def test_real_run_loop():
     """Drives QubeSatFSM.run() itself (not a copy of its loop) for ~70 min of fake time."""
     f, cm, radio = make()

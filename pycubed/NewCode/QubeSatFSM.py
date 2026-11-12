@@ -278,6 +278,13 @@ class QubeSatFSM:
         # should execute all of the actions in each state
         self.tasks = self._build_tasks_for_state(self.state)
 
+        # A ground lock survives a reboot (TODO B6): boot straight into the locked state.
+        # A locked DEPLOY is never restored: it would fire the burn wires again on every reset.
+        locked_state = _load_lock()
+        if locked_state in (StateID.IDLE, StateID.SCIENCE, StateID.COMMS):
+            self.locked = True
+            self.transition(locked_state, force=True)
+
     @property
     def mission_time(self):
         """Seconds since the burn wire first fired (persisted); 0 before the burn."""
@@ -527,6 +534,7 @@ class QubeSatFSM:
                 return
             print("[FSM] Safety override: clearing ground lock.")
             self.locked = False
+            _save_lock(None)
         self.transition(StateID.IDLE, force=True)
 
     # ---- ground commands (called by CommsManager) ----
@@ -564,6 +572,7 @@ class QubeSatFSM:
             self.burn_attempts = 0
             self.burn_done = {w: False for w in self.BURN_WIRES}
         self.transition(new_state, force=True)
+        _save_lock(new_state if (self.locked and new_state != StateID.DEPLOY) else None)
 
     def telemetry_packet(self):
         """
