@@ -373,7 +373,7 @@ class QubeSatFSM:
             StateID.COMMS: self.build_comms_tasks,
         }
 
-    def _build_tasks_for_state(self, state: StateID):
+    def _build_tasks_for_state(self, state: int):
         return self._state_builders()[state]()
 
     # building tasks for each of the states
@@ -554,7 +554,7 @@ class QubeSatFSM:
 
     # going to start defining the functions that are ran for each action in the tasks
 
-    def transition(self, new_state: StateID, force=False):
+    def transition(self, new_state: int, force=False):
         # force=True is for ground commands and safety overrides; everything the
         # autonomous logic does goes through here with force=False and respects the lock.
         if self.locked and not force:
