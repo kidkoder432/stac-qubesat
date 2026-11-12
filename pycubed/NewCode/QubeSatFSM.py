@@ -14,10 +14,22 @@ from Comms import build_beacon_packet
 import random
 import struct
 
-# "Deployed" flag kept in NVM so a reboot doesn't re-fire the burn wire.
-# The pycubed library uses NVM bytes 0-16 and Comms.py uses 20-26, so 19 is free. Fresh NVM = 0 = not deployed.
+# NVM map (Q-X6). The pycubed library uses bytes 0-16, Comms.py uses 20-26. The FSM uses:
+#   19      deployed flag (magic)
+#   32-71   mission-time ring: 8 slots x 5 bytes (u32 seconds big-endian + checksum)
+#   72-74   state lock: magic, locked state, state ^ 0xC3
+#   75      "ground has been heard since deploy" flag (magic)
+# Fresh NVM may read as 0x00 or 0xFF; every record below needs a valid magic/checksum, and
+# neither all-zero nor all-0xFF passes, so fresh NVM reads as "nothing saved".
 _NVM_DEPLOYED = 19
 _DEPLOYED_MAGIC = 0xD5
+_NVM_CLOCK = 32
+_CLOCK_SLOTS = 8
+_CLOCK_SLOT_SIZE = 5
+_NVM_LOCK = 72
+_LOCK_MAGIC = 0xA5
+_NVM_CONTACT = 75
+_CONTACT_MAGIC = 0xC7
 
 try:
     import microcontroller
@@ -25,6 +37,12 @@ try:
     _nvm = microcontroller.nvm
 except ImportError:
     _nvm = bytearray(256)  # desktop fallback
+
+
+def _nvm_put(index, value):
+    """Write one NVM byte only if it changed (flash wear)."""
+    if _nvm[index] != value:
+        _nvm[index] = value
 
 
 def _load_deployed():
@@ -36,10 +54,80 @@ def _load_deployed():
 
 def _save_deployed():
     try:
-        _nvm[_NVM_DEPLOYED] = _DEPLOYED_MAGIC
+        _nvm_put(_NVM_DEPLOYED, _DEPLOYED_MAGIC)
     except Exception as e:
         print("[FSM] Could not persist deployed flag:", e)
 
+
+def _load_contact():
+    try:
+        return _nvm[_NVM_CONTACT] == _CONTACT_MAGIC
+    except Exception:
+        return False
+
+
+def _save_contact():
+    try:
+        _nvm_put(_NVM_CONTACT, _CONTACT_MAGIC)
+    except Exception as e:
+        print("[FSM] Could not persist ground-contact flag:", e)
+
+
+def _clock_checksum(raw4):
+    return (raw4[0] + raw4[1] + raw4[2] + raw4[3]) & 0xFF ^ 0x5A
+
+
+def _clock_slot_value(slot):
+    base = _NVM_CLOCK + slot * _CLOCK_SLOT_SIZE
+    rec = bytes(_nvm[base : base + _CLOCK_SLOT_SIZE])
+    if len(rec) != _CLOCK_SLOT_SIZE or _clock_checksum(rec) != rec[4]:
+        return None
+    return struct.unpack(">I", rec[:4])[0]
+
+
+def _load_clock():
+    """Return (seconds, slot) of the newest valid record. (0, -1) if there is none."""
+    best, best_slot = None, -1
+    try:
+        for slot in range(_CLOCK_SLOTS):
+            v = _clock_slot_value(slot)
+            if v is not None and (best is None or v > best):
+                best, best_slot = v, slot
+    except Exception:
+        return 0, -1
+    return (best if best is not None else 0), best_slot
+
+
+def _save_clock(seconds, last_slot):
+    """Write to the slot after the newest one, so a power cut mid-write leaves the older record valid."""
+    slot = (last_slot + 1) % _CLOCK_SLOTS
+    raw = struct.pack(">I", int(seconds) & 0xFFFFFFFF)
+    base = _NVM_CLOCK + slot * _CLOCK_SLOT_SIZE
+    _nvm[base : base + _CLOCK_SLOT_SIZE] = raw + bytes([_clock_checksum(raw)])
+    return slot
+
+
+def _load_lock():
+    """The state the ground locked, or None."""
+    try:
+        if _nvm[_NVM_LOCK] == _LOCK_MAGIC and _nvm[_NVM_LOCK + 2] == _nvm[_NVM_LOCK + 1] ^ 0xC3:
+            return _nvm[_NVM_LOCK + 1]
+    except Exception:
+        pass
+    return None
+
+
+def _save_lock(state):
+    """state = the locked state code, or None to clear. Magic is written last."""
+    try:
+        if state is None:
+            _nvm_put(_NVM_LOCK, 0)
+        else:
+            _nvm_put(_NVM_LOCK + 1, state)
+            _nvm_put(_NVM_LOCK + 2, state ^ 0xC3)
+            _nvm_put(_NVM_LOCK, _LOCK_MAGIC)
+    except Exception as e:
+        print("[FSM] Could not persist lock:", e)
 
 
 def _temperature_c():
@@ -75,7 +163,14 @@ class QubeSatFSM:
     # "Ground contact" = a valid command received after the burn ran.
     BURN_RETRY_BACKOFF_S = 60 * 60  # burn raised an error: retry this often (any state)
     BURN_REBURN_AFTER_S = 12 * 60 * 60  # burn "worked" but we never heard from ground: re-burn
-    BURN_MAX_TOTAL = 10  # cap on burns that actually ran, per boot (power / heat); errors don't count
+    BURN_MAX_TOTAL = 20  # cap on wire burns that actually ran, per boot (10 per wire); errors don't count
+    # Both wires are needed: each releases one half of the dipole antenna (Q-D3).
+    BURN_WIRES = ("1", "2")
+    # UNKNOWN until the burn-wire team answers Q-D1. Passed to BurnWire exactly as before
+    # (it treats the first as a percent and ignores the second, see docs/FSM_SPEC.md section 6).
+    BURN_DUTY = 0.25
+    BURN_DURATION_S = 30
+    MISSION_CLOCK_SAVE_S = 15 * 60  # save mission time to NVM this often (lost on reboot: up to this much)
     BAT_THRESH_SCIENCE = 8.0  # volts needed to leave IDLE (low threshold above = 6.0)
 
     # science vs comms: P(science) falls linearly from MAX to MIN over the mission
@@ -100,15 +195,28 @@ class QubeSatFSM:
     def __init__(self):
         self.state = StateID.IDLE  # default state = charging mode
         self.current_code = StateCodec.encode(StateID.IDLE)
-        self.mission_time = 0.0  # seconds since run() started, updated every loop
-        self._start_time = None  # time.monotonic() when run() started
+        # Two clocks. `uptime` = seconds since this boot (timers: deploy wait, watchdog, ...).
+        # `mission_time` (property) = seconds since the burn wire first fired, kept in NVM
+        # so it survives reboots (Q-M3). It is 0 until the burn.
+        self.uptime = 0.0
+        self._start_time = time.monotonic()
+        self._clock_base = 0  # mission seconds already counted before this boot
+        self._clock_started_at = None  # uptime when mission time started counting; None = not started
+        self._clock_slot = -1
+        self._clock_saved_at = 0.0
         self.log_file = None
-        self._state_entered_at = 0.0  # mission_time when the current state began
-        self.deployed = _load_deployed()  # True once the burn wire has fired (persists)
+        self._state_entered_at = 0.0  # uptime when the current state began
+        self.deployed = _load_deployed()  # True once both burn wires have fired (persists)
+        if self.deployed:
+            self._clock_base, self._clock_slot = _load_clock()
+            self._clock_started_at = 0.0
+        self.burn_done = {w: False for w in self.BURN_WIRES}  # wires fired in the current burn cycle
         self.burn_attempts = 0
         self.burn_total = 0  # burns attempted since boot (watchdog cap)
-        self._last_burn_time = None  # mission_time of the last burn attempt
-        self.last_ground_contact = None  # mission_time of the first command heard after deploy
+        self._last_burn_time = None  # uptime of the last burn attempt
+        # uptime of the first command heard after deploy; remembered across reboots so a
+        # working antenna is not burned again after every reset
+        self.last_ground_contact = 0.0 if (self.deployed and _load_contact()) else None
         self.locked = False  # True = ground has locked the state; transition checks do nothing
         self.power = PowerLevel()
         self.temperature = (
@@ -158,6 +266,34 @@ class QubeSatFSM:
         # making a dictionary to be able to call each state
         # should execute all of the actions in each state
         self.tasks = self._build_tasks_for_state(self.state)
+
+    @property
+    def mission_time(self):
+        """Seconds since the burn wire first fired (persisted); 0 before the burn."""
+        if self._clock_started_at is None:
+            return float(self._clock_base)
+        return self._clock_base + (self.uptime - self._clock_started_at)
+
+    def _start_mission_clock(self):
+        if self._clock_started_at is not None:
+            return  # already counting; a re-burn does not restart it
+        self._clock_base = 0
+        self._clock_started_at = self.uptime
+        self._save_mission_clock()
+
+    def _save_mission_clock(self):
+        try:
+            self._clock_slot = _save_clock(self.mission_time, self._clock_slot)
+        except Exception as e:
+            print("[FSM] Could not persist mission time:", e)
+        self._clock_saved_at = self.uptime
+
+    def _maybe_save_mission_clock(self):
+        if (
+            self._clock_started_at is not None
+            and self.uptime - self._clock_saved_at >= self.MISSION_CLOCK_SAVE_S
+        ):
+            self._save_mission_clock()
 
     def _state_builders(self):
         return {
@@ -348,7 +484,7 @@ class QubeSatFSM:
             return
         print(f"[FSM] Transition: {StateID.name(self.state)} -> {StateID.name(new_state)}")
         self.state = new_state
-        self._state_entered_at = self.mission_time
+        self._state_entered_at = self.uptime
         self.current_code = StateCodec.encode(
             new_state
         )  # adding this so that when state changes -> so does current code
@@ -402,7 +538,8 @@ class QubeSatFSM:
         new_state = code
         print(f"[FSM] Ground command: {StateID.name(new_state)}, lock={bool(lock)}")
         if self.deployed and self.last_ground_contact is None:
-            self.last_ground_contact = self.mission_time  # antenna evidently works
+            self.last_ground_contact = self.uptime  # antenna evidently works
+            _save_contact()
         if new_state == StateID.STOP:
             # Comms has already stopped transmitting (it keeps listening). The FSM keeps
             # running in its current state; sending any non-zero state resumes transmission.
@@ -415,6 +552,7 @@ class QubeSatFSM:
             # entering DEPLOY by command = try the burn wire again, even if it gave up before.
             # (To re-burn while already in DEPLOY, command another state first.)
             self.burn_attempts = 0
+            self.burn_done = {w: False for w in self.BURN_WIRES}
         self.transition(new_state, force=True)
 
     def telemetry_packet(self):
@@ -486,18 +624,26 @@ class QubeSatFSM:
         except Exception as e:
             print("[COMMS] Solar panel check error:", e)
 
-    # burn wire clAss is already made -> just need to call it
     def _task_activate_burn_wire(self):
+        """
+        Fire every wire that has not fired yet in this cycle (both wires: Q-D3). If wire 2 fails
+        after wire 1 worked, the retry fires only wire 2. `deployed` (and the mission clock)
+        start only once all wires have fired.
+        """
         self.burn_attempts += 1
-        self._last_burn_time = self.mission_time
+        self._last_burn_time = self.uptime
         try:
             burn = BurnWire()
-            burn.cubesatBurn("1", 0.25, 30)  # burn wire 1, 25% duty cycle, 30 seconds
-            self.solar_panels_on = True  # burn wire deploys panels
+            for wire in self.BURN_WIRES:
+                if self.burn_done[wire]:
+                    continue
+                burn.cubesatBurn(wire, self.BURN_DUTY, self.BURN_DURATION_S)
+                self.burn_done[wire] = True
+                self.burn_total += 1  # only burns that actually ran count toward the cap
             self.equipment_check["burn_wire"] = True
-            self.burn_total += 1  # only burns that actually ran count toward the cap
             self.deployed = True
             _save_deployed()
+            self._start_mission_clock()
             print(f"[DEPLOY] Burn wire status: {burn.burningCheck()}")
             self._remove_task("Burn Wire")
         except Exception as e:
@@ -524,14 +670,17 @@ class QubeSatFSM:
                 return  # the first attempt is DEPLOY's job
             ref = self._last_burn_time
             wait = self.BURN_RETRY_BACKOFF_S
-        if self.mission_time - ref < wait:
+        if self.uptime - ref < wait:
             return
         try:
             if cubesat.battery_voltage < self.BAT_THRESH_SCIENCE:
                 return  # don't burn on a weak battery; try again next check
         except Exception:
             return
-        print(f"[WATCHDOG] No antenna confirmation; re-firing burn wire (burn #{self.burn_total + 1}).")
+        print(f"[WATCHDOG] No antenna confirmation; re-firing burn wires (wire burns so far: {self.burn_total}).")
+        if self.deployed:
+            # re-burn both: either half may be stuck. (Before deployment, retry only what failed.)
+            self.burn_done = {w: False for w in self.BURN_WIRES}
         self._task_activate_burn_wire()
 
     def _remove_task(self, name):
@@ -605,7 +754,7 @@ class QubeSatFSM:
             if self.deployed:
                 self.transition(self._choose_science_or_comms())
             elif (
-                self.mission_time >= self.DEPLOY_AFTER_IDLE_S
+                self.uptime >= self.DEPLOY_AFTER_IDLE_S
                 and self.burn_attempts < self.BURN_MAX_ATTEMPTS
             ):
                 self.transition(StateID.DEPLOY)
@@ -622,8 +771,8 @@ class QubeSatFSM:
             # otherwise: still waiting on burn wire / SD card, stay in DEPLOY
 
         elif self.state in (StateID.SCIENCE, StateID.COMMS):
-            if self.mission_time - self._state_entered_at >= self.STATE_DWELL_S:
-                self._state_entered_at = self.mission_time  # restart dwell even if same state
+            if self.uptime - self._state_entered_at >= self.STATE_DWELL_S:
+                self._state_entered_at = self.uptime  # restart dwell even if same state
                 self.transition(self._choose_science_or_comms())
 
     def _check_equipment_functional(self):
@@ -693,26 +842,28 @@ class QubeSatFSM:
         except Exception as e:
             print("[SCIENCE] Receive data error:", e)
 
+    def tick(self, now):
+        """One loop iteration: update the clocks, run due tasks (highest priority first), service comms."""
+        self.uptime = now - self._start_time
+        self._maybe_save_mission_clock()
+
+        task_list = self.tasks
+        for task in sorted(task_list, key=lambda t: t.priority):
+            if task.is_due(now):
+                task.run()
+                if self.tasks is not task_list:
+                    break  # a task changed state; start over with the new list
+
+        # tick comms every loop iteration (handles RX/TX scheduling)
+        if self.comms:
+            self.comms.update()
+
     def run(self):
         print("[FSM] Starting mission.")
         self._start_time = time.monotonic()
         while True:
             try:
-                now = time.monotonic()
-                self.mission_time = now - self._start_time
-
-                # run any tasks that are due, highest priority (lowest number) first
-                task_list = self.tasks
-                for task in sorted(task_list, key=lambda t: t.priority):
-                    if task.is_due(now):
-                        task.run()
-                        if self.tasks is not task_list:
-                            break  # a task changed state; start over with the new list
-
-                # tick comms every loop iteration (handles RX/TX scheduling)
-                if self.comms:
-                    self.comms.update()
-
+                self.tick(time.monotonic())
                 time.sleep(0.1)
 
             except Exception as e:

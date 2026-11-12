@@ -59,8 +59,9 @@ _lib.pycubed = pycubed
 sys.modules["lib"] = _lib
 sys.modules["lib.pycubed"] = pycubed
 
-burns = []
-burn_mode = {"fail": False}
+burns = []  # time of every wire burn
+burn_wires = []  # which wire each burn used
+burn_mode = {"fail": False, "fail_wire": None}
 
 
 class FakeBurnWire:
@@ -68,9 +69,10 @@ class FakeBurnWire:
         pass
 
     def cubesatBurn(self, num, duty, dur):
-        burns.append(clock[0])
-        if burn_mode["fail"]:
+        if burn_mode["fail"] or burn_mode["fail_wire"] == num:
             raise RuntimeError("relay fail")
+        burns.append(clock[0])
+        burn_wires.append(num)
 
     def burningCheck(self):
         return "not burning"
@@ -106,8 +108,11 @@ def reset_world():
     cubesat.temperature = 25.0
     cubesat.sd_ok = True
     burns.clear()
+    burn_wires.clear()
     burn_mode["fail"] = False
-    Q._nvm[Q._NVM_DEPLOYED] = 0
+    burn_mode["fail_wire"] = None
+    for i in range(len(Q._nvm)):
+        Q._nvm[i] = 0
     for i in range(len(C._nvm)):
         C._nvm[i] = 0
 
@@ -131,15 +136,7 @@ def step(f, cm, dt, n=1):
     with contextlib.redirect_stdout(io.StringIO()):
         for _ in range(n):
             clock[0] += dt
-            f.mission_time = clock[0]
-            tl = f.tasks
-            for t in sorted(tl, key=lambda t: t.priority):
-                if t.is_due(clock[0]):
-                    t.run()
-                    if f.tasks is not tl:
-                        break
-            if cm:
-                cm.update()
+            f.tick(clock[0])  # the same loop body run() uses
 
 
 def cmd(radio, code, lock=False):
@@ -301,7 +298,7 @@ def test_deploy_command_spam_burns_once():
     for _ in range(4):
         cmd(radio, StateID.DEPLOY, lock=True)
     step(f, cm, 1, 10)
-    assert len(burns) == 1, "repeats of DEPLOY while in DEPLOY must not re-arm the burn"
+    assert len(burns) == 2, "one cycle (both wires); repeats of DEPLOY must not re-arm the burn"
 
 
 def test_safety_overrides_lock_and_clears_it():
@@ -336,7 +333,8 @@ def test_burn_error_retries_forever_then_recovers():
     f, cm, radio = make()
     burn_mode["fail"] = True
     step(f, cm, 30, int(24 * 3600 / 30))
-    assert len(burns) > 10 and f.state == StateID.IDLE and not f.deployed
+    assert not burns and f.state == StateID.IDLE and not f.deployed
+    assert f.burn_attempts >= 3, "kept retrying"
     burn_mode["fail"] = False
     step(f, cm, 30, int(3 * 3600 / 30))
     assert f.deployed
@@ -345,7 +343,7 @@ def test_burn_error_retries_forever_then_recovers():
 def test_burn_ok_but_silent_reburns_until_ground_heard():
     f, cm, radio = make()
     step(f, cm, 30, int(40 * 3600 / 30))
-    assert len(burns) >= 3  # first burn + 12 h re-burns
+    assert len(burns) >= 6  # first burn + 12 h re-burns, two wires each
     n = len(burns)
     cmd(radio, StateID.IDLE)
     step(f, cm, 1, 2)
@@ -360,7 +358,7 @@ def test_ground_deploy_command_rearms_burn():
     n = len(burns)
     cmd(radio, StateID.DEPLOY, lock=True)
     step(f, cm, 1, 3)
-    assert f.state == StateID.DEPLOY and len(burns) == n + 1
+    assert f.state == StateID.DEPLOY and len(burns) == n + 2  # both wires
 
 
 def test_sd_failure_is_detected():
@@ -388,6 +386,93 @@ def test_snapshot_packet_layout():
     assert len(pkt) == 13 and pkt[0] == 1 and pkt[1] == StateID.IDLE
 
 
+def test_both_wires_fire_and_deploy_needs_both():
+    f, cm, radio = make()
+    step(f, cm, 10, 380)
+    assert burn_wires[:2] == ["1", "2"] and f.deployed
+
+
+def test_wire2_failure_retries_only_wire2():
+    f, cm, radio = make()
+    burn_mode["fail_wire"] = "2"
+    step(f, cm, 10, 380)
+    assert burn_wires == ["1"] and not f.deployed
+    assert Q._nvm[Q._NVM_DEPLOYED] != Q._DEPLOYED_MAGIC
+    burn_mode["fail_wire"] = None
+    step(f, cm, 30, int(3 * 3600 / 30))
+    assert burn_wires == ["1", "2"], "wire 1 must not be fired again"
+    assert f.deployed
+
+
+def test_watchdog_reburns_both_wires():
+    f, cm, radio = make()
+    step(f, cm, 30, int(14 * 3600 / 30))  # one cycle, then 12 h of silence
+    assert burn_wires[:4] == ["1", "2", "1", "2"]
+
+
+def test_mission_time_starts_at_burn():
+    f, cm, radio = make()
+    step(f, cm, 10, 300)  # 3000 s of uptime, no burn yet
+    assert f.mission_time == 0 and not f.deployed
+    step(f, cm, 10, 80)
+    assert f.deployed
+    t0 = f.mission_time
+    step(f, cm, 10, 10)
+    assert abs((f.mission_time - t0) - 100) < 1e-6
+
+
+def _reboot():
+    with contextlib.redirect_stdout(io.StringIO()):
+        return Q.QubeSatFSM()
+
+
+def test_mission_time_survives_reboot():
+    f, cm, radio = make()
+    step(f, cm, 30, int(3 * 3600 / 30))
+    elapsed = f.mission_time
+    assert elapsed > 3600
+    clock[0] = 0.0
+    f2 = _reboot()
+    assert 0 < f2.mission_time <= elapsed
+    assert elapsed - f2.mission_time <= Q.QubeSatFSM.MISSION_CLOCK_SAVE_S + 30, "lose at most one save period"
+
+
+def test_mission_time_ring_wraps_and_skips_a_torn_write():
+    f, cm, radio = make()
+    step(f, cm, 30, int(5 * 3600 / 30))  # ~20 saves: the 8-slot ring has wrapped
+    saves_ok = f.mission_time
+    # tear the newest record (power cut mid-write): the previous one must still load
+    newest = Q._load_clock()[1]
+    base = Q._NVM_CLOCK + newest * Q._CLOCK_SLOT_SIZE
+    Q._nvm[base + 4] ^= 0xFF
+    clock[0] = 0.0
+    f2 = _reboot()
+    assert 0 < f2.mission_time < saves_ok
+    assert saves_ok - f2.mission_time <= 2 * Q.QubeSatFSM.MISSION_CLOCK_SAVE_S + 30
+
+
+def test_fresh_nvm_ff_reads_as_nothing_saved():
+    reset_world()
+    for i in range(len(Q._nvm)):
+        Q._nvm[i] = 0xFF
+    f = _reboot()
+    assert not f.deployed and f.mission_time == 0 and f.last_ground_contact is None
+
+
+def test_ground_contact_survives_reboot_so_antenna_is_not_reburned():
+    f, cm, radio = make()
+    step(f, cm, 10, 380)
+    cmd(radio, StateID.IDLE)
+    step(f, cm, 1, 2)
+    assert f.last_ground_contact is not None
+    n = len(burns)
+    clock[0] = 0.0
+    f2 = _reboot()
+    assert f2.last_ground_contact is not None
+    step(f2, None, 30, int(36 * 3600 / 30))
+    assert len(burns) == n, "ground was heard before the reboot; no re-burn"
+
+
 def test_real_run_loop():
     """Drives QubeSatFSM.run() itself (not a copy of its loop) for ~70 min of fake time."""
     f, cm, radio = make()
@@ -411,7 +496,8 @@ def test_real_run_loop():
     finally:
         time.sleep = real_sleep
     assert f.deployed, "run() should have reached DEPLOY and burned"
-    assert f.mission_time > 3600
+    assert f.uptime > 3600
+    assert 0 < f.mission_time < f.uptime, "mission time counts from the burn, not from boot"
     assert f.state in (StateID.SCIENCE, StateID.COMMS)
 
 
