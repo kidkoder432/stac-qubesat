@@ -10,7 +10,9 @@ it fails here instead of being silently swallowed by a try/except on the board.
 
 import contextlib
 import io
+import os
 import sys
+import tempfile
 import time
 import types
 
@@ -37,8 +39,14 @@ class CubeSat:
     hardware = {"Radio1": True}
     sd_ok = True
 
+    sd_dir = tempfile.mkdtemp()
+    n_files = 0
+
     def new_file(self, substring, binary=False):
-        return "/sd/data/mission00000.txt" if self.sd_ok else None
+        if not self.sd_ok:
+            return None
+        CubeSat.n_files += 1
+        return os.path.join(CubeSat.sd_dir, "mission%05d.txt" % CubeSat.n_files)
 
     def log(self, msg):
         pass
@@ -81,8 +89,22 @@ class FakeBurnWire:
 m = types.ModuleType("BurnWire")
 m.BurnWire = FakeBurnWire
 sys.modules["BurnWire"] = m
+payload_mode = {"fail": False}
+
+
+class FakePayload:
+    def ping(self):
+        return not payload_mode["fail"]
+
+    def read_photodiode(self):
+        return None if payload_mode["fail"] else 1.5e-6
+
+    def measure_contrast(self, freq, timeout=30.0):
+        return None if payload_mode["fail"] else 0.01 * (freq - 2790)
+
+
 m = types.ModuleType("PayloadUART")
-m.PayloadUART = lambda *a: None
+m.PayloadUART = lambda *a: FakePayload()
 sys.modules["PayloadUART"] = m
 
 import Comms as C  # noqa: E402
@@ -107,10 +129,14 @@ def reset_world():
     cubesat.battery_voltage = 8.2
     cubesat.temperature = 25.0
     cubesat.sd_ok = True
+    for name in os.listdir(CubeSat.sd_dir):
+        os.remove(os.path.join(CubeSat.sd_dir, name))
+    CubeSat.n_files = 0
     burns.clear()
     burn_wires.clear()
     burn_mode["fail"] = False
     burn_mode["fail_wire"] = None
+    payload_mode["fail"] = False
     for i in range(len(Q._nvm)):
         Q._nvm[i] = 0
     for i in range(len(C._nvm)):
@@ -383,7 +409,7 @@ def test_beacon_is_tinygs_packet_and_goes_out():
 def test_snapshot_packet_layout():
     f, cm, radio = make()
     pkt = f.telemetry_packet()
-    assert len(pkt) == 13 and pkt[0] == 1 and pkt[1] == StateID.IDLE
+    assert len(pkt) == 17 and pkt[0] == 2 and pkt[1] == StateID.IDLE
 
 
 def test_both_wires_fire_and_deploy_needs_both():
@@ -522,6 +548,82 @@ def test_after_low_battery_returns_to_the_scheduled_state():
     cubesat.battery_voltage = 8.4
     step(f, cm, 10, 3)
     assert f.state == StateID.COMMS
+
+
+def _science_files():
+    return sorted(
+        os.path.join(CubeSat.sd_dir, n) for n in os.listdir(CubeSat.sd_dir) if n.startswith("mission")
+    )
+
+
+def _read_rows():
+    rows = []
+    for path in _science_files():
+        with open(path) as fh:
+            rows += [ln.strip().split(",") for ln in fh if ln.strip()]
+    return [r for r in rows if r[0] != "mission_s"]
+
+
+def test_science_sweeps_all_points_and_counts_completed_sweeps():
+    f, cm, radio = make()
+    cmd(radio, StateID.SCIENCE, lock=True)
+    step(f, cm, 1, 2)
+    n_points = (f.SWEEP_END_MHZ - f.SWEEP_START_MHZ) // f.SWEEP_STEP_MHZ + 1
+    step(f, cm, 10, n_points * 2 + 5)  # a bit over two full sweeps at 10 s per point
+    assert f.sweeps_completed == 2
+    rows = _read_rows()
+    first = [r for r in rows if r[1] == "0"]
+    assert [int(r[2]) for r in first] == list(range(2800, 2951)), "every frequency once, in order"
+    assert all(r[3] != "ERR" and r[4] != "ERR" for r in first)
+
+
+def test_science_file_has_header_and_mission_time_column():
+    f, cm, radio = make()
+    cmd(radio, StateID.SCIENCE, lock=True)
+    step(f, cm, 1, 2)
+    step(f, cm, 10, 5)
+    with open(_science_files()[-1]) as fh:
+        assert fh.readline().strip() == Q.QubeSatFSM.SCIENCE_FILE_HEADER
+
+
+def test_science_records_after_a_reboot_without_passing_through_deploy():
+    """After a reboot the FSM goes IDLE -> SCIENCE; the SD card must still get initialized."""
+    f, cm, radio = make()
+    step(f, cm, 10, 380)
+    assert f.deployed
+    clock[0] = 0.0
+    f2 = _reboot()
+    assert not f2.sd_card_initialized
+    before = len(_read_rows())
+    step(f2, None, 10, 30)
+    assert f2.state == StateID.SCIENCE and f2.sd_card_initialized
+    assert len(_read_rows()) > before
+
+
+def test_payload_failure_is_recorded_counted_and_does_not_stop_the_sweep():
+    f, cm, radio = make()
+    cmd(radio, StateID.SCIENCE, lock=True)
+    step(f, cm, 1, 2)
+    payload_mode["fail"] = True
+    step(f, cm, 10, 6)
+    assert f.payload_errors >= 5
+    assert any(r[3] == "ERR" for r in _read_rows())
+    assert f.current_sweep_freq > 2800, "the sweep keeps stepping"
+    payload_mode["fail"] = False
+    step(f, cm, 10, 2)
+    assert f.payload_errors == 0
+    pkt = f.telemetry_packet()
+    assert pkt[-1] == 0
+
+
+def test_telemetry_reports_sweep_progress_and_ground_contact():
+    f, cm, radio = make()
+    cmd(radio, StateID.SCIENCE, lock=True)
+    step(f, cm, 1, 2)
+    step(f, cm, 10, 12)
+    pkt = f.telemetry_packet()
+    sweeps, point = pkt[13] << 8 | pkt[14], pkt[15]
+    assert sweeps == 0 and point == f.current_sweep_freq - 2800 and point >= 10
 
 
 def test_real_run_loop():

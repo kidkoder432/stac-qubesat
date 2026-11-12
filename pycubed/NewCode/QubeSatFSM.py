@@ -172,6 +172,12 @@ class QubeSatFSM:
     MISSION_CLOCK_SAVE_S = 15 * 60  # save mission time to NVM this often (lost on reboot: up to this much)
     BAT_THRESH_SCIENCE = 8.0  # volts needed to leave IDLE (low threshold above = 6.0)
 
+    # ODMR sweep (Q-S1: assumed, payload team to confirm): one point per SCIENCE "Receive Data" run.
+    SWEEP_START_MHZ = 2800
+    SWEEP_END_MHZ = 2950
+    SWEEP_STEP_MHZ = 1
+    SCIENCE_FILE_HEADER = "mission_s,sweep,freq_mhz,contrast,photodiode_a"
+
     # Science / comms split (Q-S6, TODO B1). Measured in mission time (seconds since the burn):
     #   first SCIENCE_ONLY_S: 100% SCIENCE (the IARU agreement)
     #   after that: a repeating cycle of SLOT_S slots, COMMS_SLOTS of COMMS then SCIENCE_SLOTS of
@@ -260,8 +266,11 @@ class QubeSatFSM:
 
         # Payload Subsystem
         self.payload = PayloadUART(cubesat)
-        self.current_sweep_freq = 2800  # Start of ODMR sweep range (2800..2950 MHz)
-        self.latest_data = None
+        self.current_sweep_freq = self.SWEEP_START_MHZ
+        self.sweep_id = 0  # the sweep in progress (0-based); also = sweeps completed so far
+        self.sweeps_completed = 0  # full sweeps (a full sweep is what the W plot needs, Q-H2)
+        self.payload_errors = 0  # consecutive science points where the payload gave nothing
+        self.latest_data = None  # (sweep_id, freq_mhz, contrast, photodiode) waiting to be recorded
 
         self.comms = None
 
@@ -558,16 +567,20 @@ class QubeSatFSM:
 
     def telemetry_packet(self):
         """
-        13-byte snapshot of internal state, big-endian:
-          u8  packet type/version (0x01). A TinyGS beacon starts with the ASCII callsign
-              (e.g. 'S'), so a first byte of 0x01 identifies this packet.
+        17-byte snapshot of internal state, big-endian:
+          u8  packet type/version (0x02). A TinyGS beacon starts with the ASCII callsign
+              (e.g. 'S'), so a first byte of 0x02 identifies this packet.
           u8  state code
-          u8  flags: b0 locked, b1 deployed, b2 sd, b3 burn wire, b4 payload, b5 solar, b6 radio
+          u8  flags: b0 locked, b1 deployed, b2 sd, b3 burn wire, b4 payload, b5 solar, b6 radio,
+                     b7 ground heard since deploy
           u8  burn attempts
           u16 battery, centivolts
           i16 IMU temp, centi-degC
-          u32 mission time, seconds
+          u32 mission time, seconds since the burn (0 before it)
           u8  c_state_err (FSM crash count)
+          u16 sweeps completed
+          u8  next sweep point (0 = first frequency)
+          u8  consecutive science points with no payload answer
         """
         eq = self.equipment_check
         flags = (
@@ -578,6 +591,7 @@ class QubeSatFSM:
             | (eq["payload"] << 4)
             | (eq["solar_panel"] << 5)
             | (eq["radio"] << 6)
+            | ((self.last_ground_contact is not None) << 7)
         )
         try:
             vbatt = int(cubesat.battery_voltage * 100)
@@ -586,9 +600,10 @@ class QubeSatFSM:
         t = _temperature_c()
         temp = int(t * 100) if t is not None else 0
         err = getattr(cubesat, "c_state_err", 0)
+        point = (self.current_sweep_freq - self.SWEEP_START_MHZ) // self.SWEEP_STEP_MHZ
         return struct.pack(
-            ">BBBBHhIB",
-            1,
+            ">BBBBHhIBHBB",
+            2,
             int(self.state),
             flags,
             self.burn_attempts & 0xFF,
@@ -596,6 +611,9 @@ class QubeSatFSM:
             max(-32768, min(temp, 32767)),
             int(self.mission_time),
             err & 0xFF,
+            min(self.sweeps_completed, 0xFFFF),
+            max(0, min(point, 255)),
+            self.payload_errors & 0xFF,
         )
 
     def _on_tx_window(self, window_num, cadence):
@@ -692,25 +710,32 @@ class QubeSatFSM:
             log_file = cubesat.new_file("/data/mission", binary=False)
             if log_file is None:  # new_file returns None if there's no SD card / can't make the dir
                 raise RuntimeError("new_file returned None (no SD card?)")
+            with open(log_file, "a") as f:
+                f.write(self.SCIENCE_FILE_HEADER + "\n")
             self.log_file = log_file
             self.sd_card_initialized = True
             self.equipment_check["sd_card"] = True
-            print(f"[DEPLOY] SD card ready: {self.log_file}")
+            print(f"[SD] Ready: {self.log_file}")
         except Exception as e:
             self.sd_card_initialized = False
-            print("[DEPLOY] SD card init failed:", e)
+            print("[SD] Init failed:", e)
 
     def _task_record_memory(self):
-        if not self.sd_card_initialized or self.log_file is None:
-            print("[DATA] SD not ready, skipping record.")
-            return
         if self.latest_data is None:
-            print("[DATA] No data to record.")
             return
+        if not self.sd_card_initialized or self.log_file is None:
+            # After a reboot the FSM goes IDLE -> SCIENCE and never passes through DEPLOY,
+            # so the SD card has to be (re)initialized here too.
+            self._task_init_sd_card()
+            if not self.sd_card_initialized:
+                print("[DATA] SD not ready, skipping record.")
+                return
+        sweep, freq, contrast, pd = self.latest_data
+        c = "ERR" if contrast is None else f"{contrast:.4f}"
+        p = "ERR" if pd is None else f"{pd:.4e}"
         try:
             with open(self.log_file, "a") as f:
-                f.write(f"{self.mission_time:.1f},{self.latest_data}\n")
-            print(f"[DATA] Recorded at t={self.mission_time:.1f}s")
+                f.write(f"{self.mission_time:.1f},{sweep},{freq},{c},{p}\n")
             self.latest_data = None  # don't write the same sample twice
         except Exception as e:
             print("[DATA] Record error:", e)
@@ -811,34 +836,31 @@ class QubeSatFSM:
 
     def _task_receive_data(self):
         """
-        Samples science payload: photodiode current and single-point ODMR optical contrast.
-        Steps frequency incrementally across 2800..2950 MHz without blocking.
+        One ODMR point per run: photodiode reading and optical contrast at the current frequency.
+        Steps SWEEP_START_MHZ..SWEEP_END_MHZ and counts a sweep as complete when the last point is taken.
+        (Contrast vs raw photodiode is still open, TODO C4, so both are recorded.)
         """
+        freq = self.current_sweep_freq
         try:
-            # 1. Read Photodiode baseline
             pd = self.payload.read_photodiode()
-
-            # 2. Measure single-frequency ODMR contrast at current frequency step
-            target_freq = self.current_sweep_freq
-            contrast = self.payload.measure_contrast(target_freq, timeout=30.0)
-
-            # 3. Format telemetry string for SD card record
-            pd_str = f"{pd:.4e}" if pd is not None else "ERR"
-            contrast_str = f"{contrast:.4f}" if contrast is not None else "ERR"
-            self.latest_data = (
-                f"FREQ={target_freq}MHz,CONTRAST={contrast_str},PD={pd_str}A"
-            )
-
-            print(f"[SCIENCE] {self.latest_data}")
-
-            # 4. Advance frequency step for next cycle (wrap around 2950 MHz)
-            self.current_sweep_freq += 1
-            if self.current_sweep_freq > 2950:
-                self.current_sweep_freq = 2800
-                print("[SCIENCE] Completed full 2800-2950 MHz sweep cycle!")
-
+            contrast = self.payload.measure_contrast(freq, timeout=30.0)
         except Exception as e:
-            print("[SCIENCE] Receive data error:", e)
+            print("[SCIENCE] Payload error:", e)
+            pd = contrast = None
+
+        if pd is None and contrast is None:
+            self.payload_errors = min(self.payload_errors + 1, 255)
+        else:
+            self.payload_errors = 0
+        self.latest_data = (self.sweep_id, freq, contrast, pd)
+        print(f"[SCIENCE] sweep {self.sweep_id} {freq} MHz contrast={contrast} pd={pd}")
+
+        self.current_sweep_freq += self.SWEEP_STEP_MHZ
+        if self.current_sweep_freq > self.SWEEP_END_MHZ:
+            self.current_sweep_freq = self.SWEEP_START_MHZ
+            self.sweeps_completed += 1
+            self.sweep_id += 1
+            print(f"[SCIENCE] Completed sweep {self.sweeps_completed}")
 
     def tick(self, now):
         """One loop iteration: update the clocks, run due tasks (highest priority first), service comms."""
