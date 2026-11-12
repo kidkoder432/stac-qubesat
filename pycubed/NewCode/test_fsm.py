@@ -884,6 +884,41 @@ def test_sd_with_room_deletes_nothing():
     assert len(_science_files()) == n
 
 
+def test_all_modules_share_one_hardware_object():
+    import hardware
+
+    assert Q.cubesat is C.cubesat is hardware.cubesat
+
+
+def test_burnwire_uses_the_shared_hardware_import():
+    src = open("BurnWire.py").read()
+    compile(src, "BurnWire.py", "exec")
+    assert "from hardware import cubesat" in src and "lib.pycubed" not in src.replace("# ", "")
+
+
+def test_bench_main_runs_the_fsm_without_energising_the_burn_wire():
+    import bench_main
+
+    cubesat.radio1 = Radio()
+    real = Q.BurnWire
+    cls = Q.QubeSatFSM
+    saved = (cls.DEPLOY_AFTER_IDLE_S, cls.SLOT_S, cls.SCIENCE_ONLY_S)  # build() changes class constants
+    try:
+        reset_world()
+        bench_main.DEPLOY_AFTER_S = 60
+        with contextlib.redirect_stdout(io.StringIO()):
+            fsm, comms = bench_main.build()
+        assert comms.state_code == C.STATE_IDLE, "fresh NVM reads as STOP; bench forces the radio on"
+        step(fsm, comms, 10, 12)
+        assert fsm.deployed, "DEPLOY_AFTER_S applied"
+        assert not burns, "the real burn wire must not be driven on the bench"
+        assert Q.BurnWire is bench_main._DryBurn
+    finally:
+        Q.BurnWire = real
+        cls.DEPLOY_AFTER_IDLE_S, cls.SLOT_S, cls.SCIENCE_ONLY_S = saved
+        del cubesat.radio1
+
+
 def test_real_run_loop():
     """Drives QubeSatFSM.run() itself (not a copy of its loop) for ~70 min of fake time."""
     f, cm, radio = make()

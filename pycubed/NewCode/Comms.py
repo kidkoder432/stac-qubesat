@@ -14,7 +14,7 @@ and must be kept in sync manually.
 """
 
 import time
-from pycubed import cubesat
+from hardware import cubesat
 
 # ── State codes ────────────────────────────────────────────────────────────────
 # Must stay in sync with StateID in StateCodeGenerator.py.

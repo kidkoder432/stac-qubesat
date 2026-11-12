@@ -7,9 +7,8 @@ from PowerLevel import PowerLevel
 from StateCodeGenerator import StateCodec, StateID
 from Task import Task
 
-# Same import form as Comms.py. Importing it under two names (pycubed vs lib.pycubed)
-# would load the module twice and create two hardware objects.
-from lib.pycubed import cubesat
+# One import path for the hardware object, shared with Comms and BurnWire (see hardware.py).
+from hardware import cubesat
 from Comms import build_beacon_packet, configure_radio
 
 import struct

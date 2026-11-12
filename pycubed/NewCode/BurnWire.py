@@ -4,7 +4,7 @@ import board
 import digitalio
 import pwmio
 
-import lib.pycubed as pycubed
+from hardware import cubesat  # shared with Comms and the FSM (see hardware.py)
 
 
 class BurnWire:
@@ -13,8 +13,8 @@ class BurnWire:
     isBurning = False  # turn to not isBurning once started and then not isBurning after the necessary time runs (30 min i think
 
     def __init__(self):
-        pycubed.cubesat._relayA.drive_mode = digitalio.DriveMode.PUSH_PULL
-        pycubed.cubesat._relayA.value = True
+        cubesat._relayA.drive_mode = digitalio.DriveMode.PUSH_PULL
+        cubesat._relayA.value = True
 
     def burningCheck(self):
         if self.isBurning == False:
@@ -47,7 +47,7 @@ class BurnWire:
         self.isBurning = False
         burnwire.duty_cycle = 0
         burnwire.deinit()
-        pycubed.cubesat._relayA.drive_mode = digitalio.DriveMode.OPEN_DRAIN
+        cubesat._relayA.drive_mode = digitalio.DriveMode.OPEN_DRAIN
 
     def turnOff(self, burn_num):
         self.cubesatBurn(burn_num, 0, 0)
