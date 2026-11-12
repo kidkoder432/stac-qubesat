@@ -9,7 +9,7 @@ from Task import Task
 # Same import form as Comms.py. Importing it under two names (pycubed vs lib.pycubed)
 # would load the module twice and create two hardware objects.
 from lib.pycubed import cubesat
-from Comms import build_beacon_packet
+from Comms import build_beacon_packet, configure_radio
 
 import struct
 
@@ -29,6 +29,7 @@ _NVM_LOCK = 72
 _LOCK_MAGIC = 0xA5
 _NVM_CONTACT = 75
 _CONTACT_MAGIC = 0xC7
+_NVM_STREAK = 76  # 76-77: consecutive fast crashes (count, count ^ 0x3C)
 
 try:
     import microcontroller
@@ -70,6 +71,27 @@ def _save_contact():
         _nvm_put(_NVM_CONTACT, _CONTACT_MAGIC)
     except Exception as e:
         print("[FSM] Could not persist ground-contact flag:", e)
+
+
+def _load_streak():
+    try:
+        n = _nvm[_NVM_STREAK]
+        return n if _nvm[_NVM_STREAK + 1] == n ^ 0x3C else 0
+    except Exception:
+        return 0
+
+
+def _save_streak(n):
+    try:
+        n = max(0, min(int(n), 255))
+        _nvm_put(_NVM_STREAK, n)
+        _nvm_put(_NVM_STREAK + 1, n ^ 0x3C)
+    except Exception as e:
+        print("[FSM] Could not persist crash streak:", e)
+
+
+class FatalFault(Exception):
+    """Raised by the watcher to make run() reset the board."""
 
 
 def _clock_checksum(raw4):
@@ -170,6 +192,18 @@ class QubeSatFSM:
     BURN_DUTY = 0.25
     BURN_DURATION_S = 30
     MISSION_CLOCK_SAVE_S = 15 * 60  # save mission time to NVM this often (lost on reboot: up to this much)
+
+    # Watcher (TODO B5). Tasks and comms run inside a guard: an exception is logged and counted,
+    # not fatal. A component that fails TASK_FAULT_LIMIT times in a row is a fault, and a fault
+    # resets the board, unless the board has already crashed RESET_STREAK_MAX times in a row
+    # without staying up HEALTHY_UPTIME_S (then it stays up degraded instead of boot-looping).
+    TASK_FAULT_LIMIT = 5
+    RESET_STREAK_MAX = 3
+    HEALTHY_UPTIME_S = 30 * 60
+    # Radio health: this many consecutive radio exceptions -> re-apply the radio settings; if
+    # that does not help RADIO_RECONFIG_LIMIT times in a row, it is a fault (a reset re-inits the radio).
+    RADIO_ERRORS_BEFORE_RECONFIG = 3
+    RADIO_RECONFIG_LIMIT = 3
     BAT_THRESH_SCIENCE = 8.0  # volts needed to leave IDLE (low threshold above = 6.0)
 
     # ODMR sweep (Q-S1: assumed, payload team to confirm): one point per SCIENCE "Receive Data" run.
@@ -219,6 +253,11 @@ class QubeSatFSM:
             self._clock_base, self._clock_slot = _load_clock()
             self._clock_started_at = 0.0
         self.burn_done = {w: False for w in self.BURN_WIRES}  # wires fired in the current burn cycle
+        self.crash_streak = _load_streak()  # fast crashes in a row, from NVM
+        self.task_errors = {}  # consecutive exceptions per task name
+        self.task_error_total = 0  # all caught task exceptions since boot (saturates at 255)
+        self.fault_count = 0
+        self.radio_reconfigs = 0
         self.burn_attempts = 0
         self.burn_total = 0  # burns attempted since boot (watchdog cap)
         self._last_burn_time = None  # uptime of the last burn attempt
@@ -243,6 +282,7 @@ class QubeSatFSM:
             "record_memory": 10,
             "init_payload": (30 * 60),
             "watchdog": 10 * 60,
+            "radio_health": 60,
         }
 
         # boolean values to check different stages of mission
@@ -351,8 +391,18 @@ class QubeSatFSM:
                 func=self._task_transition_check,
             ),
             self._watchdog_task(4),
+            self._radio_health_task(5),
         ]
         return tasks
+
+    def _radio_health_task(self, priority):
+        return Task(
+            "Radio Health",
+            priority,
+            self.periods["radio_health"],
+            schedule_later=True,
+            func=self._task_radio_health,
+        )
 
     def _watchdog_task(self, priority):
         return Task(
@@ -403,6 +453,7 @@ class QubeSatFSM:
                 schedule_later=True,
                 func=self._task_transition_check,
             ),
+            self._radio_health_task(6),
         ]
         return tasks
 
@@ -437,6 +488,7 @@ class QubeSatFSM:
                 func=self._task_transition_check,
             ),
             self._watchdog_task(5),
+            self._radio_health_task(6),
         ]
         return tasks
 
@@ -479,6 +531,7 @@ class QubeSatFSM:
                 func=self._task_transition_check,
             ),
             self._watchdog_task(6),
+            self._radio_health_task(7),
         ]
         return tasks
 
@@ -576,9 +629,9 @@ class QubeSatFSM:
 
     def telemetry_packet(self):
         """
-        17-byte snapshot of internal state, big-endian:
-          u8  packet type/version (0x02). A TinyGS beacon starts with the ASCII callsign
-              (e.g. 'S'), so a first byte of 0x02 identifies this packet.
+        18-byte snapshot of internal state, big-endian:
+          u8  packet type/version (0x03). A TinyGS beacon starts with the ASCII callsign
+              (e.g. 'S'), so a first byte of 0x03 identifies this packet.
           u8  state code
           u8  flags: b0 locked, b1 deployed, b2 sd, b3 burn wire, b4 payload, b5 solar, b6 radio,
                      b7 ground heard since deploy
@@ -590,6 +643,7 @@ class QubeSatFSM:
           u16 sweeps completed
           u8  next sweep point (0 = first frequency)
           u8  consecutive science points with no payload answer
+          u8  caught task exceptions since boot (watcher), saturating
         """
         eq = self.equipment_check
         flags = (
@@ -611,8 +665,8 @@ class QubeSatFSM:
         err = getattr(cubesat, "c_state_err", 0)
         point = (self.current_sweep_freq - self.SWEEP_START_MHZ) // self.SWEEP_STEP_MHZ
         return struct.pack(
-            ">BBBBHhIBHBB",
-            2,
+            ">BBBBHhIBHBBB",
+            3,
             int(self.state),
             flags,
             self.burn_attempts & 0xFF,
@@ -623,6 +677,7 @@ class QubeSatFSM:
             min(self.sweeps_completed, 0xFFFF),
             max(0, min(point, 255)),
             self.payload_errors & 0xFF,
+            self.task_error_total & 0xFF,
         )
 
     def _on_tx_window(self, window_num, cadence):
@@ -871,21 +926,73 @@ class QubeSatFSM:
             self.sweep_id += 1
             print(f"[SCIENCE] Completed sweep {self.sweeps_completed}")
 
+    def _guarded(self, name, fn):
+        """Run fn(); an exception is logged and counted. Repeated failures of the same thing are a fault."""
+        try:
+            fn()
+            self.task_errors[name] = 0
+        except FatalFault:
+            raise
+        except Exception as e:
+            n = self.task_errors.get(name, 0) + 1
+            self.task_errors[name] = n
+            self.task_error_total = min(self.task_error_total + 1, 255)
+            print(f"[WATCHER] {name} raised {e!r} ({n} in a row)")
+            try:
+                cubesat.log(f"{name},{e}")
+            except Exception:
+                pass
+            if n >= self.TASK_FAULT_LIMIT:
+                self._fault(f"{name} failed {n} times in a row: {e!r}")
+
+    def _fault(self, reason):
+        """A component is not recovering. Reset the board, unless it has been crash-looping."""
+        self.fault_count += 1
+        self.task_errors.clear()
+        if self.crash_streak >= self.RESET_STREAK_MAX:
+            print(f"[WATCHER] Fault ({reason}) but {self.crash_streak} fast crashes in a row; staying up degraded.")
+            return
+        raise FatalFault(reason)
+
+    def _task_radio_health(self):
+        if self.comms is None:
+            return
+        errors = self.comms.radio_errors
+        self.equipment_check["radio"] = errors == 0
+        if errors == 0:
+            self.radio_reconfigs = 0
+            return
+        if errors < self.RADIO_ERRORS_BEFORE_RECONFIG:
+            return
+        print(f"[RADIO] {errors} errors in a row; re-applying radio settings.")
+        self.radio_reconfigs += 1
+        try:
+            configure_radio()
+            self.comms.radio_errors = 0  # the next RX/TX call decides if that worked
+        except Exception as e:
+            print("[RADIO] Reconfigure failed:", e)
+        if self.radio_reconfigs >= self.RADIO_RECONFIG_LIMIT:
+            self.radio_reconfigs = 0
+            self._fault("radio is not recovering")
+
     def tick(self, now):
         """One loop iteration: update the clocks, run due tasks (highest priority first), service comms."""
         self.uptime = now - self._start_time
         self._maybe_save_mission_clock()
+        if self.crash_streak and self.uptime >= self.HEALTHY_UPTIME_S:
+            self.crash_streak = 0  # stayed up long enough: not a crash loop
+            _save_streak(0)
 
         task_list = self.tasks
         for task in sorted(task_list, key=lambda t: t.priority):
             if task.is_due(now):
-                task.run()
+                self._guarded(task.name, task.run)
                 if self.tasks is not task_list:
                     break  # a task changed state; start over with the new list
 
         # tick comms every loop iteration (handles RX/TX scheduling)
         if self.comms:
-            self.comms.update()
+            self._guarded("Comms", self.comms.update)
 
     def run(self):
         print("[FSM] Starting mission.")
@@ -897,6 +1004,8 @@ class QubeSatFSM:
 
             except Exception as e:
                 print("[FSM] FATAL ERROR:", e)
+                self.crash_streak += 1
+                _save_streak(self.crash_streak)
                 try:
                     cubesat.c_state_err += 1
                     cubesat.log(f"{e},{cubesat.c_state_err},{cubesat.c_boot}")

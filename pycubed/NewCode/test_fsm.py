@@ -36,6 +36,7 @@ class CubeSat:
     solar_charging = True
     charge_current = 120.0  # mA
     c_state_err = 0
+    c_boot = 1
     hardware = {"Radio1": True}
     sd_ok = True
 
@@ -52,7 +53,19 @@ class CubeSat:
         pass
 
     class micro:
-        pass
+        class RunMode:
+            NORMAL = 0
+
+        resets = []
+
+        @staticmethod
+        def on_next_reset(mode):
+            pass
+
+        @staticmethod
+        def reset():
+            CubeSat.micro.resets.append(clock[0])
+            raise StopRun()  # end the loop under test; a real reset never returns
 
 
 cubesat = CubeSat()
@@ -116,11 +129,16 @@ from Task import Task  # noqa: E402
 class Radio:
     def __init__(self):
         self.rx, self.tx = [], []
+        self.fail = False
 
     def receive(self, timeout=0):
+        if self.fail:
+            raise RuntimeError("spi hang")
         return self.rx.pop(0) if self.rx else None
 
     def send(self, b):
+        if self.fail:
+            raise RuntimeError("spi hang")
         self.tx.append(bytes(b))
 
 
@@ -137,6 +155,8 @@ def reset_world():
     burn_mode["fail"] = False
     burn_mode["fail_wire"] = None
     payload_mode["fail"] = False
+    CubeSat.micro.resets.clear()
+    cubesat.c_state_err = 0
     for i in range(len(Q._nvm)):
         Q._nvm[i] = 0
     for i in range(len(C._nvm)):
@@ -409,7 +429,7 @@ def test_beacon_is_tinygs_packet_and_goes_out():
 def test_snapshot_packet_layout():
     f, cm, radio = make()
     pkt = f.telemetry_packet()
-    assert len(pkt) == 17 and pkt[0] == 2 and pkt[1] == StateID.IDLE
+    assert len(pkt) == 18 and pkt[0] == 3 and pkt[1] == StateID.IDLE
 
 
 def test_both_wires_fire_and_deploy_needs_both():
@@ -613,7 +633,7 @@ def test_payload_failure_is_recorded_counted_and_does_not_stop_the_sweep():
     step(f, cm, 10, 2)
     assert f.payload_errors == 0
     pkt = f.telemetry_packet()
-    assert pkt[-1] == 0
+    assert pkt[-2] == 0, "payload error count is back to 0"
 
 
 def test_telemetry_reports_sweep_progress_and_ground_contact():
@@ -704,6 +724,130 @@ def test_repeated_commands_do_not_rewrite_nvm():
         assert _CountingNVM.writes == before, "same lock again: no NVM writes"
     finally:
         Q._nvm = real
+
+
+def _add_failing_task(f, fail_times):
+    state = {"n": 0}
+
+    def boom():
+        state["n"] += 1
+        if state["n"] <= fail_times:
+            raise ValueError("bug")
+
+    f.tasks = f.tasks + [Task("Boom", 9, 1, False, boom)]
+    return state
+
+
+def test_task_exception_is_isolated_and_counted():
+    f, cm, radio = make()
+    _add_failing_task(f, 3)
+    step(f, cm, 1, 10)  # 3 failures, then it works: no fault, everything else kept running
+    assert f.task_error_total == 3 and f.task_errors["Boom"] == 0
+    assert f.fault_count == 0 and f.state == StateID.IDLE
+    assert f.telemetry_packet()[-1] == 3
+
+
+def test_task_failing_repeatedly_is_a_fault_and_resets():
+    f, cm, radio = make()
+    _add_failing_task(f, 10**6)
+    try:
+        step(f, cm, 1, 20)
+        raise AssertionError("expected a fault")
+    except Q.FatalFault as e:
+        assert "Boom" in str(e)
+    assert f.fault_count == 1
+
+
+def test_crash_loop_guard_keeps_the_board_up_degraded():
+    f, cm, radio = make()
+    f.crash_streak = f.RESET_STREAK_MAX
+    _add_failing_task(f, 10**6)
+    step(f, cm, 1, 30)  # would have reset; must not raise
+    assert f.fault_count >= 1 and f.state == StateID.IDLE
+
+
+def test_run_loop_resets_after_a_fault_and_remembers_the_crash():
+    f, cm, radio = make()
+    f.comms = cm
+    _add_failing_task(f, 10**6)
+
+    ticks = [0]
+
+    def fake_sleep(dt):
+        clock[0] += 1.0
+        ticks[0] += 1
+        if ticks[0] > 200:  # a broken watcher must fail this test, not hang it
+            raise StopRun()
+
+    real_sleep = time.sleep
+    time.sleep = fake_sleep
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                f.run()
+            except StopRun:
+                pass
+    finally:
+        time.sleep = real_sleep
+    assert len(CubeSat.micro.resets) == 1
+    assert cubesat.c_state_err == 1
+    assert Q._load_streak() == 1, "the crash is remembered across the reset"
+
+
+def test_streak_clears_after_healthy_uptime():
+    reset_world()
+    Q._save_streak(2)
+    f = _reboot()
+    assert f.crash_streak == 2
+    step(f, None, 60, int((Q.QubeSatFSM.HEALTHY_UPTIME_S + 120) / 60))
+    assert f.crash_streak == 0 and Q._load_streak() == 0
+
+
+def test_fresh_nvm_streak_is_zero():
+    reset_world()
+    for i in range(len(Q._nvm)):
+        Q._nvm[i] = 0xFF
+    assert _reboot().crash_streak == 0
+
+
+def test_comms_exception_does_not_kill_the_loop():
+    f, cm, radio = make()
+    cm.update = lambda: (_ for _ in ()).throw(RuntimeError("comms bug"))
+    step(f, cm, 1, 3)
+    assert f.task_errors["Comms"] == 3 and f.state == StateID.IDLE
+
+
+def test_radio_errors_trigger_reconfigure_then_recover():
+    f, cm, radio = make()
+    calls = []
+    real = Q.configure_radio
+    Q.configure_radio = lambda: calls.append(1)
+    try:
+        radio.fail = True
+        step(f, cm, 1, 70)  # radio health runs every 60 s
+        assert cm.radio_errors >= 3 and not f.equipment_check["radio"]
+        assert calls, "radio settings should be re-applied"
+        radio.fail = False
+        step(f, cm, 1, 130)
+        assert cm.radio_errors == 0 and f.equipment_check["radio"] is True
+        assert f.radio_reconfigs == 0
+    finally:
+        Q.configure_radio = real
+
+
+def test_radio_that_never_recovers_is_a_fault():
+    f, cm, radio = make()
+    real = Q.configure_radio
+    Q.configure_radio = lambda: None  # reconfigure "works" but the radio stays broken
+    try:
+        radio.fail = True
+        try:
+            step(f, cm, 1, 60 * 6)
+            raise AssertionError("expected a fault")
+        except Q.FatalFault as e:
+            assert "radio" in str(e)
+    finally:
+        Q.configure_radio = real
 
 
 def test_real_run_loop():

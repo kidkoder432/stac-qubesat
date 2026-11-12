@@ -349,6 +349,7 @@ class CommsManager:
         self._rx_elapsed = 0
         self._tx_sent    = 0
         self._tx_windows = 0   # increments each time a TX window ends
+        self.radio_errors = 0  # consecutive radio exceptions (RX or TX); 0 after any clean call
 
         self._telem_q   = _RingQueue(maxsize=16)
         self._amateur_q = _RingQueue(maxsize=32)
@@ -508,15 +509,20 @@ class CommsManager:
 
     def _receive(self):
         try:
-            return self._radio.receive(timeout=0.1)
+            raw = self._radio.receive(timeout=0.1)
+            self.radio_errors = 0
+            return raw
         except Exception as e:
+            self.radio_errors = min(self.radio_errors + 1, 255)
             print("[COMMS] RX error:", e)
             return None
 
     def _send(self, header, payload):
         try:
             self._radio.send(bytes([header]) + payload)
+            self.radio_errors = 0
         except Exception as e:
+            self.radio_errors = min(self.radio_errors + 1, 255)
             print("[COMMS] TX error:", e)
 
 
