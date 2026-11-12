@@ -28,8 +28,9 @@ _VALID_CODES = (STATE_STOP, STATE_IDLE, STATE_DEPLOY, STATE_SCIENCE, STATE_COMMS
 
 # ── Radio hardware config ──────────────────────────────────────────────────────
 # These values must match exactly what is registered on https://tinygs.com for QubeSat.
-# Confirm the frequency is within your IARU/FCC license before flight.
-FREQ_MHZ         = 433.0
+# Frequency from the team (Q-C2 in docs/FSM_SPEC.md). Confirm against the IARU coordination
+# and the callsign (still a placeholder) before flight.
+FREQ_MHZ         = 433.72
 SIGNAL_BW        = 125000
 SPREADING_FACTOR = 7
 CODING_RATE      = 5    # 4/5 — most common TinyGS coding rate; was 8 (4/8)
@@ -168,7 +169,6 @@ HDR_TELEMETRY = 0xD0   # downlink: telemetry
 HDR_AMATEUR   = 0xA0   # bi-directional: amateur / ham radio
 
 LOCK_BIT = 0x80  # top bit of the state byte in CMD_SET_STATE (state codes are 7-bit)
-CMD_DEDUP_WINDOW_S = 60.0  # ignore an identical (state, lock) command repeated within this
 
 CMD_SET_STATE  = 0x01
 CMD_SET_CONFIG = 0x02
@@ -178,8 +178,9 @@ CMD_SET_CONFIG = 0x02
 def build_state_command(state_code, lock=False):
     """
     Build an encrypted uplink packet to command the satellite to a new FSM state.
-    Transmit multiple times from the ground for reliability (satellite deduplicates
-    identical commands received within CMD_DEDUP_WINDOW_S).
+    The ground may repeat the command for reliability. Repeats are harmless: a command for
+    the state the satellite is already in changes nothing, and NVM is only written when the
+    state code actually changes.
 
     lock=True  -> satellite goes to the state and the FSM's transition logic is frozen
     lock=False -> satellite goes to the state, then the FSM transitions on its own again
@@ -352,8 +353,6 @@ class CommsManager:
         self._telem_q   = _RingQueue(maxsize=16)
         self._amateur_q = _RingQueue(maxsize=32)
 
-        self._last_state_cmd      = None   # (state, lock) of the last accepted state command
-        self._last_state_cmd_time = 0.0
         self.on_state_command = None   # fn(new_state_code: int, lock: bool)
         self.on_tx_window     = None   # fn(window_num: int, cadence: int)
         self.on_amateur_rx    = None   # fn(payload: bytes)
@@ -367,8 +366,9 @@ class CommsManager:
     @state_code.setter
     def state_code(self, code):
         code = code & 0x7F
+        if code != self._state_code:   # a spammed command must not rewrite NVM every time
+            _nvm_write_state(code)
         self._state_code = code
-        _nvm_write_state(code)
 
     def push_telemetry(self, packet):
         """Enqueue a telemetry packet for downlink (high priority). Returns False if full."""
@@ -488,17 +488,9 @@ class CommsManager:
             if new_code not in _VALID_CODES:
                 print("[COMMS] Unrecognized state code:", new_code)
                 return
-            # Deduplicate the ground spamming one command for reliability. Done by time
-            # window rather than "same as the stored state", because the FSM can change
-            # state on its own and a deliberate re-send must still go through.
-            now = time.monotonic()
-            if self._last_state_cmd == (new_code, lock) and (
-                now - self._last_state_cmd_time < CMD_DEDUP_WINDOW_S
-            ):
-                return
-            self._last_state_cmd = (new_code, lock)
-            self._last_state_cmd_time = now
-            self.state_code = new_code   # writes to all 3 NVM copies + checksum
+            # No dedup: the ground spams a code and every copy is passed to the FSM, which
+            # treats a command for the current state as a no-op (see Q-H8, Q-G5, Q-C10).
+            self.state_code = new_code   # writes to all 3 NVM copies + checksum, only on change
             print("[COMMS] State ->", new_code, "lock" if lock else "unlock")
             if self.on_state_command is not None:
                 self.on_state_command(new_code, lock)

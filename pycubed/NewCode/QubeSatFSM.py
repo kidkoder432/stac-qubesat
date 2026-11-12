@@ -409,13 +409,13 @@ class QubeSatFSM:
             print("[FSM] STOP: transmission halted by Comms, FSM state unchanged.")
             return
         self.locked = bool(lock)
-        if new_state == StateID.DEPLOY:
-            # commanding DEPLOY = try the burn wire again, even if it gave up before
+        # The ground repeats a command for reliability, so a command for the state we are
+        # already in must change nothing (Q-H8, Q-G5): transition() ignores it.
+        if new_state == StateID.DEPLOY and self.state != StateID.DEPLOY:
+            # entering DEPLOY by command = try the burn wire again, even if it gave up before.
+            # (To re-burn while already in DEPLOY, command another state first.)
             self.burn_attempts = 0
-            self.transition(new_state, force=True)
-            self.tasks = self._build_tasks_for_state(StateID.DEPLOY)  # also if already in DEPLOY
-        else:
-            self.transition(new_state, force=True)
+        self.transition(new_state, force=True)
 
     def telemetry_packet(self):
         """

@@ -51,6 +51,13 @@ cubesat = CubeSat()
 pycubed = types.ModuleType("pycubed")
 pycubed.cubesat = cubesat
 sys.modules["pycubed"] = pycubed
+# The FSM and BurnWire import `lib.pycubed`, Comms and PayloadUART import `pycubed`. Stub both
+# names to the same object here. (On the board that mix could load the library twice: Q-X5.)
+_lib = types.ModuleType("lib")
+_lib.__path__ = []
+_lib.pycubed = pycubed
+sys.modules["lib"] = _lib
+sys.modules["lib.pycubed"] = pycubed
 
 burns = []
 burn_mode = {"fail": False}
@@ -146,6 +153,10 @@ def test_state_codes_match_comms():
     assert StateID.DEPLOY == C.STATE_DEPLOY
     assert StateID.SCIENCE == C.STATE_SCIENCE
     assert StateID.COMMS == C.STATE_COMMS
+
+
+def test_radio_frequency_is_the_team_answer():
+    assert abs(C.FREQ_MHZ - 433.72) < 1e-9
 
 
 def test_task_scheduling():
@@ -265,15 +276,32 @@ def test_overheat_forces_idle():
     assert f.state == StateID.IDLE
 
 
-def test_command_spam_applied_once():
+def test_command_spam_is_harmless():
+    """Ground repeats a code; every copy reaches the FSM but nothing changes after the first."""
     f, cm, radio = make()
-    for _ in range(5):
-        cmd(radio, StateID.SCIENCE, lock=True)
-    seen = []
-    orig = f.command_state
-    cm.on_state_command = lambda c, l: (seen.append((c, l)), orig(c, l))
+    writes = []
+    real = C._nvm_write_state
+    C._nvm_write_state = lambda c: (writes.append(c), real(c))
+    try:
+        for _ in range(5):
+            cmd(radio, StateID.SCIENCE, lock=True)
+        seen = []
+        orig = f.command_state
+        cm.on_state_command = lambda c, l: (seen.append((c, l)), orig(c, l))
+        step(f, cm, 1, 10)
+    finally:
+        C._nvm_write_state = real
+    assert len(seen) == 5, "no dedup window any more: every copy is delivered"
+    assert f.state == StateID.SCIENCE and f.locked
+    assert writes == [StateID.SCIENCE], "NVM written once, not once per repeat"
+
+
+def test_deploy_command_spam_burns_once():
+    f, cm, radio = make()
+    for _ in range(4):
+        cmd(radio, StateID.DEPLOY, lock=True)
     step(f, cm, 1, 10)
-    assert seen == [(StateID.SCIENCE, True)]
+    assert len(burns) == 1, "repeats of DEPLOY while in DEPLOY must not re-arm the burn"
 
 
 def test_safety_overrides_lock_and_clears_it():
