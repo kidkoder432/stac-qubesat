@@ -178,7 +178,7 @@ def test_boot_idle_then_deploy_then_science():
     assert burns, "burn wire should fire after DEPLOY_AFTER_IDLE_S"
     assert f.deployed and Q._nvm[Q._NVM_DEPLOYED] == Q._DEPLOYED_MAGIC
     step(f, cm, 10, 5)
-    assert f.state in (StateID.SCIENCE, StateID.COMMS)
+    assert f.state == StateID.SCIENCE, "first 14 days after the burn are all science"
 
 
 def test_reboot_does_not_reburn():
@@ -471,6 +471,57 @@ def test_ground_contact_survives_reboot_so_antenna_is_not_reburned():
     assert f2.last_ground_contact is not None
     step(f2, None, 30, int(36 * 3600 / 30))
     assert len(burns) == n, "ground was heard before the reboot; no re-burn"
+
+
+def _set_mission_time(f, seconds):
+    f._clock_base = seconds
+    f._clock_started_at = f.uptime
+
+
+def test_schedule_14_days_science_then_7_comms_3_science():
+    f, cm, radio = make()
+    S = Q.QubeSatFSM
+    for t in (0, 100, S.SCIENCE_ONLY_S - 1):
+        _set_mission_time(f, t)
+        assert f._scheduled_state() == StateID.SCIENCE
+    for k in range(25):  # 2.5 cycles
+        _set_mission_time(f, S.SCIENCE_ONLY_S + k * S.SLOT_S)
+        expected = StateID.COMMS if (k % 10) < 7 else StateID.SCIENCE
+        assert f._scheduled_state() == expected, k
+    _set_mission_time(f, S.SCIENCE_ONLY_S + 7 * S.SLOT_S - 1)
+    assert f._scheduled_state() == StateID.COMMS
+    _set_mission_time(f, S.SCIENCE_ONLY_S + 7 * S.SLOT_S)
+    assert f._scheduled_state() == StateID.SCIENCE
+
+
+def test_split_is_70_30_after_two_weeks():
+    f, cm, radio = make()
+    step(f, cm, 10, 380)  # deploy
+    assert f.deployed
+    S = Q.QubeSatFSM
+    _set_mission_time(f, S.SCIENCE_ONLY_S)
+    comms = science = 0
+    for _ in range(6000):  # 10 full cycles of 100 min, 10 s per step
+        step(f, cm, 10, 1)
+        if f.state == StateID.COMMS:
+            comms += 1
+        elif f.state == StateID.SCIENCE:
+            science += 1
+    frac = comms / float(comms + science)
+    assert 0.69 <= frac <= 0.71, frac
+
+
+def test_after_low_battery_returns_to_the_scheduled_state():
+    f, cm, radio = make()
+    step(f, cm, 10, 380)
+    S = Q.QubeSatFSM
+    _set_mission_time(f, S.SCIENCE_ONLY_S + 2 * S.SLOT_S)  # a COMMS slot
+    cubesat.battery_voltage = 5.9
+    step(f, cm, 30, 3)
+    assert f.state == StateID.IDLE
+    cubesat.battery_voltage = 8.4
+    step(f, cm, 10, 3)
+    assert f.state == StateID.COMMS
 
 
 def test_real_run_loop():

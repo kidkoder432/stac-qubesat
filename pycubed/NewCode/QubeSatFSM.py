@@ -11,7 +11,6 @@ from Task import Task
 from lib.pycubed import cubesat
 from Comms import build_beacon_packet
 
-import random
 import struct
 
 # NVM map (Q-X6). The pycubed library uses bytes 0-16, Comms.py uses 20-26. The FSM uses:
@@ -173,11 +172,15 @@ class QubeSatFSM:
     MISSION_CLOCK_SAVE_S = 15 * 60  # save mission time to NVM this often (lost on reboot: up to this much)
     BAT_THRESH_SCIENCE = 8.0  # volts needed to leave IDLE (low threshold above = 6.0)
 
-    # science vs comms: P(science) falls linearly from MAX to MIN over the mission
-    SCIENCE_WEIGHT_MAX = 1.0  # 100% science at t=0
-    SCIENCE_WEIGHT_MIN = 0.1  # 10% science at end of life
-    MISSION_EOL_S = 90 * 24 * 3600  # 90 day mission
-    STATE_DWELL_S = 10 * 60  # stay in SCIENCE/COMMS at least this long before re-rolling
+    # Science / comms split (Q-S6, TODO B1). Measured in mission time (seconds since the burn):
+    #   first SCIENCE_ONLY_S: 100% SCIENCE (the IARU agreement)
+    #   after that: a repeating cycle of SLOT_S slots, COMMS_SLOTS of COMMS then SCIENCE_SLOTS of
+    #   SCIENCE (7 x 10 min comms, 3 x 10 min science = 70% / 30%).
+    # The state is a pure function of mission time, so it also survives a reboot.
+    SCIENCE_ONLY_S = 14 * 24 * 3600
+    SLOT_S = 10 * 60
+    COMMS_SLOTS = 7
+    SCIENCE_SLOTS = 3
 
     # When the ground has locked a state, should a low battery / overheat still force IDLE?
     # True  = yes (safe: protects against brownout; the lock is cleared when it happens)
@@ -205,7 +208,6 @@ class QubeSatFSM:
         self._clock_slot = -1
         self._clock_saved_at = 0.0
         self.log_file = None
-        self._state_entered_at = 0.0  # uptime when the current state began
         self.deployed = _load_deployed()  # True once both burn wires have fired (persists)
         if self.deployed:
             self._clock_base, self._clock_slot = _load_clock()
@@ -484,7 +486,6 @@ class QubeSatFSM:
             return
         print(f"[FSM] Transition: {StateID.name(self.state)} -> {StateID.name(new_state)}")
         self.state = new_state
-        self._state_entered_at = self.uptime
         self.current_code = StateCodec.encode(
             new_state
         )  # adding this so that when state changes -> so does current code
@@ -737,7 +738,7 @@ class QubeSatFSM:
     #   IDLE    -> SCIENCE/COMMS   already deployed and battery >= BAT_THRESH_SCIENCE
     #   DEPLOY  -> SCIENCE/COMMS   burn wire done, SD ready, battery ok (sends handshake)
     #   DEPLOY  -> IDLE            battery low, or burn wire gave up
-    #   SCIENCE <-> COMMS          re-rolled every STATE_DWELL_S using the mission-time weighting
+    #   SCIENCE <-> COMMS          follows _scheduled_state() (14 days science, then 7/3 slots)
     def _task_transition_check(self):
         if self.locked:
             return  # ground has locked the state
@@ -752,7 +753,7 @@ class QubeSatFSM:
             if not battery_ok:
                 return
             if self.deployed:
-                self.transition(self._choose_science_or_comms())
+                self.transition(self._scheduled_state())
             elif (
                 self.uptime >= self.DEPLOY_AFTER_IDLE_S
                 and self.burn_attempts < self.BURN_MAX_ATTEMPTS
@@ -764,16 +765,14 @@ class QubeSatFSM:
                 self.transition(StateID.IDLE)
             elif self.deployed and self._check_equipment_functional():
                 self._send_handshake()
-                self.transition(self._choose_science_or_comms())
+                self.transition(self._scheduled_state())
             elif not self.deployed and self.burn_attempts >= self.BURN_MAX_ATTEMPTS:
                 print("[TRANSITION] Burn wire failed -> IDLE")
                 self.transition(StateID.IDLE)
             # otherwise: still waiting on burn wire / SD card, stay in DEPLOY
 
         elif self.state in (StateID.SCIENCE, StateID.COMMS):
-            if self.uptime - self._state_entered_at >= self.STATE_DWELL_S:
-                self._state_entered_at = self.uptime  # restart dwell even if same state
-                self.transition(self._choose_science_or_comms())
+            self.transition(self._scheduled_state())  # no-op when already in the right state
 
     def _check_equipment_functional(self):
         """Deploy-time check. Payload and solar panels are checked by their own states."""
@@ -781,14 +780,13 @@ class QubeSatFSM:
             self.equipment_check["sd_card"] and self.equipment_check["burn_wire"]
         )
 
-    def _choose_science_or_comms(self):
-        """P(science) falls linearly from SCIENCE_WEIGHT_MAX to _MIN over MISSION_EOL_S."""
-        t = min(self.mission_time, self.MISSION_EOL_S)
-        span = self.SCIENCE_WEIGHT_MAX - self.SCIENCE_WEIGHT_MIN
-        science_weight = self.SCIENCE_WEIGHT_MAX - span * (t / self.MISSION_EOL_S)
-        chosen = StateID.SCIENCE if random.random() < science_weight else StateID.COMMS
-        print(f"[TRANSITION] science_weight={science_weight:.2f} -> {StateID.name(chosen)}")
-        return chosen
+    def _scheduled_state(self):
+        """SCIENCE for the first SCIENCE_ONLY_S of mission time, then COMMS_SLOTS of COMMS and SCIENCE_SLOTS of SCIENCE, repeating."""
+        t = self.mission_time
+        if t < self.SCIENCE_ONLY_S:
+            return StateID.SCIENCE
+        slot = int((t - self.SCIENCE_ONLY_S) // self.SLOT_S) % (self.COMMS_SLOTS + self.SCIENCE_SLOTS)
+        return StateID.COMMS if slot < self.COMMS_SLOTS else StateID.SCIENCE
 
     def _send_handshake(self):
         """Tell the ground that deploy finished. Placeholder packet format."""
