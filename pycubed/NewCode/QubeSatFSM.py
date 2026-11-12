@@ -706,9 +706,10 @@ class QubeSatFSM:
     # i think solar input is enabled by hardware and not software, so ill just check current for now
     def _task_enable_solar_panels(self):
         try:
-            # board API: solar_charging (bool, LTC4121 CHRG pin) and charge_current (mA)
+            # board API: solar_charging is a property (bool, LTC4121 CHRG pin) but charge_current
+            # is a plain METHOD in lib/pycubed.py (no @property), so it has to be called.
             charging = cubesat.solar_charging
-            print(f"[COMMS] Solar charging: {charging}, {cubesat.charge_current:.1f} mA")
+            print(f"[COMMS] Solar charging: {charging}, {cubesat.charge_current():.1f} mA")
             if charging:
                 self.solar_panels_on = True
                 self.equipment_check["solar_panel"] = True

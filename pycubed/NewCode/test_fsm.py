@@ -34,7 +34,9 @@ class CubeSat:
     battery_voltage = 8.2  # V
     temperature = 25.0  # degC (IMU)
     solar_charging = True
-    charge_current = 120.0  # mA
+    def charge_current(self):  # a plain method on the real board (no @property), so a test must call it
+        return 120.0  # mA
+
     c_state_err = 0
     c_boot = 1
     hardware = {"Radio1": True}
