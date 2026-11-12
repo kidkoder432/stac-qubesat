@@ -55,7 +55,11 @@ Commands can be typed with backspace support, full words, or quick single-charac
 | `mw test` | `5` | Test HMC832 SPI communication and enable rails | `mw test` |
 | `mw freq <MHz>` | — | Set microwave VCO frequency (25 to 3000 MHz) | `mw freq 2870` |
 | `mw point <MHz>` | — | Measure optical contrast at target MHz (Command '4') | `mw point 2870` |
-| `mw sweep` | `w` | Run full 151-point ODMR contrast sweep | `mw sweep` |
+| `mw quick` | `q` | Quick ODMR sweep: 2 cycles, 5 samples, every 5 MHz (about 1 min) | `mw quick` |
+| `mw sweep <cycles> <samples> <step>` | — | Custom ODMR sweep (cycles 1..100, samples 1..1000, step 1..150 MHz) | `mw sweep 2 5 5` |
+| `mw sweep` | `w` | Full ODMR sweep: 10 cycles, 100 samples, every 1 MHz (about 5 hours) | `mw sweep` |
+
+Any key cancels a running sweep. Each finished frequency prints `DATA,<cycle>,<freq_mhz>,<contrast>`; save the console to a file and run `python3 plot_odmr_sweep.py <file>` for a CSV and a plot.
 
 ### [Communication (PyCubed UART & External I2C)]
 | Command | Shortcut | Description | Example |

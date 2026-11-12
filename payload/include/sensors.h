@@ -20,6 +20,10 @@ bool readPhotodiodeSensor(int cs_pin, int device_num, int channel_num, float& ph
 bool ensurePhotodiodeADCConfigured();
 bool measurePhotodiodeOnce(float& photocurrent);
 
+// While quiet, the per-reading prints (ADC code, voltage, photocurrent) are suppressed. Errors
+// still print. Used by long sweeps so the console shows progress instead of thousands of lines.
+void setSensorQuiet(bool quiet);
+
 // High level & CLI routines
 void readSingleRTD(int rtd_number);
 void readAllRTDTemperatures();

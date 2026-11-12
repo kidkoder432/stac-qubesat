@@ -2,6 +2,9 @@
 #include "power.h"
 #include "driver/gpio.h"
 
+static bool g_sensor_quiet = false;
+void setSensorQuiet(bool quiet) { g_sensor_quiet = quiet; }
+
 // ======================= AD4130 CONFIG: RTD =======================
 
 bool ad4130_configure_for_rtd_generic(int cs_pin, int device_num, int channel_num, RTDConfig& config) {
@@ -216,8 +219,10 @@ float calculatePhotocurrent(uint32_t adc_data) {
 
   float photocurrent = voltage / PHOTODIODE_TIA_RESISTOR;
 
-  Serial.printf("    ADC code: %u, Voltage: %.6f V\n", (unsigned int)adc_data, voltage);
-  Serial.printf("    Calculated photocurrent: %.3f nA\n", photocurrent * 1e9);
+  if (!g_sensor_quiet) {
+    Serial.printf("    ADC code: %u, Voltage: %.6f V\n", (unsigned int)adc_data, voltage);
+    Serial.printf("    Calculated photocurrent: %.3f nA\n", photocurrent * 1e9);
+  }
 
   return photocurrent;
 }
@@ -267,7 +272,7 @@ bool readRTDSensorGeneric(int cs_pin, int device_num, int channel_num, float& te
 }
 
 bool readPhotodiodeSensor(int cs_pin, int device_num, int channel_num, float& photocurrent) {
-  Serial.printf("Reading photodiode sensor device #%d channel %d...\n", device_num, channel_num);
+  if (!g_sensor_quiet) Serial.printf("Reading photodiode sensor device #%d channel %d...\n", device_num, channel_num);
 
   uint16_t adc_control_single = AD4130_ADC_CONTROL_SINGLE;
   ad4130_write_register_16(cs_pin, AD4130_REG_ADC_CONTROL, adc_control_single);
@@ -298,7 +303,7 @@ bool readPhotodiodeSensor(int cs_pin, int device_num, int channel_num, float& ph
   uint16_t adc_control_idle = AD4130_ADC_CONTROL_IDLE;
   ad4130_write_register_16(cs_pin, AD4130_REG_ADC_CONTROL, adc_control_idle);
 
-  Serial.printf("  ✓ Photocurrent: %.3f nA\n", photocurrent * 1e9);
+  if (!g_sensor_quiet) Serial.printf("  ✓ Photocurrent: %.3f nA\n", photocurrent * 1e9);
 
   return true;
 }

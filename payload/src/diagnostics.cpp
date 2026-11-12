@@ -29,7 +29,10 @@ void printMenu() {
   Serial.println("  mw test                  - Test synthesizer SPI      (shortcut: '5')");
   Serial.println("  mw freq <MHz>            - Set arbitrary VCO freq (25-3000 MHz)");
   Serial.println("  mw point <MHz>           - Measure ODMR point contrast (Cmd '4', 2800-2950)");
-  Serial.println("  mw sweep                 - Full 151-pt sweep         (shortcut: 'w')");
+  Serial.println("  mw sweep                 - Full 151-pt, 10-cycle, 100-sample sweep (~5 h) (shortcut: 'w')");
+  Serial.println("  mw sweep <cyc> <smp> <step> - Custom sweep, e.g. 'mw sweep 2 5 5'");
+  Serial.println("  mw quick                 - Quick sweep: 2 cycles, 5 samples, 5 MHz (~1 min) (shortcut: 'q')");
+  Serial.println("                             Any key cancels a sweep. Results print as DATA,cycle,freq_mhz,contrast");
   Serial.println("\n[COMMUNICATION]");
   Serial.println("  i2c                      - Scan external I2C bus     (shortcut: '6')");
   Serial.println("  uart test                - Test PyCubed UART link    (shortcut: '7')");
@@ -171,6 +174,7 @@ void processDeveloperCommand(String cmdLine) {
       case 't': case 'T': continuousRTDMonitoring(); return;
       case 'p': case 'P': readPhotodiode(); return;
       case 'w': case 'W': runMicrowaveContrastSweep(); return;
+      case 'q': case 'Q': runMicrowaveQuickSweep(); return;
       case 's': case 'S': showStatus(); return;
       case 'd': case 'D': runFullDiagnostics(); return;
       case 'm': case 'M': case '?': printMenu(); return;
@@ -305,10 +309,22 @@ void processDeveloperCommand(String cmdLine) {
       }
     }
     else if (arg1Lower == "sweep") {
-      runMicrowaveContrastSweep();
+      if (arg2.length() == 0) {
+        runMicrowaveContrastSweep();
+      } else {
+        int cycles = 0, samples = 0, step = 0;
+        if (sscanf(arg2.c_str(), "%d %d %d", &cycles, &samples, &step) == 3) {
+          runMicrowaveSweep(cycles, samples, step);
+        } else {
+          Serial.println("Usage: mw sweep [<cycles> <samples> <step_MHz>]   e.g. mw sweep 2 5 5");
+        }
+      }
+    }
+    else if (arg1Lower == "quick") {
+      runMicrowaveQuickSweep();
     }
     else {
-      Serial.println("Usage: mw <test | freq <MHz> | point <MHz> | sweep>");
+      Serial.println("Usage: mw <test | freq <MHz> | point <MHz> | sweep [<cyc> <smp> <step>] | quick>");
     }
   }
   // ---------------- I2C / UART COMMUNICATION ----------------

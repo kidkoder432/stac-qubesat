@@ -200,7 +200,48 @@ void testMicrowave() {
   // }
 }
 
-void runMicrowaveContrastSweep() {
+// True if any byte arrived on the USB serial console since the last check (the bytes are
+// consumed). Lets a long sweep be stopped from the keyboard without cutting power.
+static bool sweepCancelRequested() {
+  if (Serial.available() > 0) {
+    while (Serial.available() > 0) Serial.read();
+    return true;
+  }
+  return false;
+}
+
+// Leave the generator in the same safe state a finished sweep does.
+static void abortSweep(const char* reason) {
+  hmc832_Set_VCO_Frequency(1500);
+  Serial.printf("\n%s; VCO set back to 1500 MHz\n", reason);
+}
+
+// Restores normal per-reading prints on every way out of a sweep (return, cancel, error).
+struct SensorQuietScope {
+  SensorQuietScope() { setSensorQuiet(true); }
+  ~SensorQuietScope() { setSensorQuiet(false); }
+};
+
+static void clearProgressLine() { Serial.print("\r                        \r"); }
+
+// ODMR contrast sweep over 2800..2950 MHz.
+//   num_cycles      how many times the whole band is swept
+//   samples_per_freq photodiode readings averaged at the reference (1500 MHz) and again at each
+//                    frequency. One reading takes about 65 ms, so the time is roughly
+//                    num_cycles * points * 2 * samples_per_freq * 65 ms.
+//   step_mhz        spacing between frequencies (1 = 151 points, 5 = 31 points)
+//
+// Every finished frequency is printed at once as a line  DATA,<cycle>,<freq_mhz>,<contrast>
+// so a cancelled sweep still leaves usable data; plot_odmr_sweep.py reads those lines straight
+// from a copy of the console. Contrast = mean photocurrent at the frequency / mean at the
+// reference, so it is about 0.85 to 1.0 whatever samples_per_freq is (ICD: contrast point).
+// Send any key on the USB serial console to cancel.
+void runMicrowaveSweep(int num_cycles, int samples_per_freq, int step_mhz) {
+  if (num_cycles < 1 || num_cycles > 100 || samples_per_freq < 1 || samples_per_freq > 1000 ||
+      step_mhz < 1 || step_mhz > 150) {
+    Serial.println("Sweep parameters out of range: cycles 1..100, samples 1..1000, step 1..150 MHz");
+    return;
+  }
   Serial.println("\n--- Microwave Contrast Sweep ---");
 
   if (!microwave_inited) {
@@ -217,21 +258,35 @@ void runMicrowaveContrastSweep() {
     return;
   }
 
-  const int num_cycles = 10;
-  const int samples_per_freq = 100;
-  const int freq_steps = 151;
+  // The command that started this sweep may have left a newline in the serial buffer; drop it
+  // so it is not mistaken for a cancel.
+  while (Serial.available() > 0) Serial.read();
+
   const int start_frequency = 2800;   // MHz
   const int end_frequency = 2950;     // MHz
-  const int step_size = (end_frequency - start_frequency + 1) / freq_steps;
   const int ref_frequency = 1500;     // MHz
+  const int n_freq = (end_frequency - start_frequency) / step_mhz + 1;
+  const bool full_format = (step_mhz == 1);  // the 151-point array the PyCubed link expects
+  const uint32_t progress_interval_ms = 250;  // progress line refresh rate
+  const int total_reads = n_freq * 2 * samples_per_freq;  // per cycle
 
-  static float contrast_arr[freq_steps];
+  static float contrast_arr[151];
+
+  Serial.printf("SWEEP,cycles=%d,samples=%d,step=%d,points=%d\n", num_cycles, samples_per_freq, step_mhz, n_freq);
+  Serial.println("DATA_COLUMNS,cycle,freq_mhz,contrast");
+  Serial.println("Send any key to cancel the sweep.");
+
+  SensorQuietScope quiet;  // no per-reading prints while sweeping; progress is shown instead
+  uint32_t last_progress_ms = 0;
+  const uint32_t sweep_start_ms = millis();
+  bool estimate_printed = false;
 
   for (int cycle = 0; cycle < num_cycles; ++cycle) {
-    Serial.printf("Cycle %d/%d\n", cycle + 1, num_cycles);
+    const uint32_t cycle_start_ms = millis();
 
-    for (int j = 0; j < freq_steps; ++j) {
-      int set_freq = start_frequency + j * step_size;
+    for (int j = 0; j < n_freq; ++j) {
+      const int set_freq = start_frequency + j * step_mhz;
+      const uint32_t freq_start_ms = millis();
 
       double low_sum = 0.0;
       double high_sum = 0.0;
@@ -241,12 +296,23 @@ void runMicrowaveContrastSweep() {
       delay(10);
 
       for (int s = 0; s < samples_per_freq; ++s) {
+        if (sweepCancelRequested()) {
+          abortSweep("Sweep CANCELLED by user");
+          return;
+        }
         float i_photo;
         if (!measurePhotodiodeOnce(i_photo)) {
+          clearProgressLine();
           Serial.println("Error during low/reference photodiode read");
+          abortSweep("Sweep aborted");
           return;
         }
         low_sum += i_photo;
+        if (millis() - last_progress_ms >= progress_interval_ms) {
+          last_progress_ms = millis();
+          Serial.printf("\r%d/%d %dMHz %3d%%  ", cycle + 1, num_cycles, set_freq,
+                        100 * (j * 2 * samples_per_freq + s + 1) / total_reads);
+        }
       }
 
       // Measurement at current sweep frequency
@@ -254,34 +320,64 @@ void runMicrowaveContrastSweep() {
       delay(10);
 
       for (int s = 0; s < samples_per_freq; ++s) {
+        if (sweepCancelRequested()) {
+          abortSweep("Sweep CANCELLED by user");
+          return;
+        }
         float i_photo;
         if (!measurePhotodiodeOnce(i_photo)) {
+          clearProgressLine();
           Serial.println("Error during high photodiode read");
+          abortSweep("Sweep aborted");
           return;
         }
         high_sum += i_photo;
+        if (millis() - last_progress_ms >= progress_interval_ms) {
+          last_progress_ms = millis();
+          Serial.printf("\r%d/%d %dMHz %3d%%  ", cycle + 1, num_cycles, set_freq,
+                        100 * (j * 2 * samples_per_freq + samples_per_freq + s + 1) / total_reads);
+        }
       }
 
       // Return to reference frequency
       hmc832_Set_VCO_Frequency(ref_frequency);
 
-      double denom = samples_per_freq * low_sum;
-      double ratio = (denom > 0.0) ? (high_sum / denom) : 0.0;
+      // Ratio of the two means (both sums have samples_per_freq terms, so it is high_sum / low_sum).
+      // The old code divided by samples_per_freq as well, which scaled contrast by 1/samples.
+      double ratio = (low_sum > 0.0) ? (high_sum / low_sum) : 0.0;
       contrast_arr[j] = (float)ratio;
+
+      clearProgressLine();
+      Serial.printf("DATA,%d,%d,%.6f\n", cycle + 1, set_freq, ratio);
+
+      if (!estimate_printed) {
+        estimate_printed = true;
+        const float est_s = (millis() - freq_start_ms) / 1000.0f * n_freq * num_cycles;
+        Serial.printf("(first frequency took %.1f s; estimated total about %.0f s = %.1f min)\n",
+                      (millis() - freq_start_ms) / 1000.0f, est_s, est_s / 60.0f);
+      }
     }
 
-    // Print the contrast array (one integer per line, like old UART behavior)
-    Serial.println("\n=== Contrast Data ===");
-    for (int i = 0; i < freq_steps; ++i) {
-      Serial.println(contrast_arr[i]);
+    Serial.printf("[cycle %d/%d done in %.1f s]\n", cycle + 1, num_cycles,
+                  (millis() - cycle_start_ms) / 1000.0);
+    if (full_format) {
+      // 151 floats (604 bytes) as one packet, the format the PyCubed side expects
+      sendContrastData(contrast_arr, n_freq);
     }
-    Serial.println("=== End Contrast Data ===\n");
-    // Send 608-byte packet over UART to PyCubed
-    sendContrastData(contrast_arr, freq_steps);
   }
 
   hmc832_Set_VCO_Frequency(1500);
-  Serial.println("Sweep complete, VCO set back to 1500 MHz");
+  Serial.printf("Sweep complete in %.1f s, VCO set back to 1500 MHz\n", (millis() - sweep_start_ms) / 1000.0);
+}
+
+// The full-quality sweep (10 cycles, 100 samples, every 1 MHz). About 5 hours; use the quick one first.
+void runMicrowaveContrastSweep() {
+  runMicrowaveSweep(10, 100, 1);
+}
+
+// A rough result in about a minute: 2 cycles, 5 samples, every 5 MHz (31 points).
+void runMicrowaveQuickSweep() {
+  runMicrowaveSweep(2, 5, 5);
 }
 
 bool measureSingleFrequencyContrast(uint16_t freq_mhz, float& contrast_out) {

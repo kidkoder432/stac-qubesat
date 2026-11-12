@@ -11,5 +11,7 @@ void hmc832_Initialize_Microwave_Generator();
 
 // Microwave testing and payload contrast sweep
 void testMicrowave();
-void runMicrowaveContrastSweep();
+void runMicrowaveContrastSweep();                                  // full: 10 cycles, 100 samples, 1 MHz (~5 h)
+void runMicrowaveQuickSweep();                                     // quick: 2 cycles, 5 samples, 5 MHz (~1 min)
+void runMicrowaveSweep(int num_cycles, int samples_per_freq, int step_mhz);
 bool measureSingleFrequencyContrast(uint16_t freq_mhz, float& contrast_out);
