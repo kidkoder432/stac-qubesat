@@ -1,3 +1,4 @@
+import os
 import time
 
 from BurnWire import BurnWire
@@ -88,6 +89,15 @@ def _save_streak(n):
         _nvm_put(_NVM_STREAK + 1, n ^ 0x3C)
     except Exception as e:
         print("[FSM] Could not persist crash streak:", e)
+
+
+def _sd_free_bytes(directory):
+    """Free bytes on the volume holding `directory`, or None if it can't be read."""
+    try:
+        st = os.statvfs(directory)
+        return st[1] * st[4]  # fragment size * blocks available
+    except Exception:
+        return None
 
 
 class FatalFault(Exception):
@@ -211,6 +221,9 @@ class QubeSatFSM:
     SWEEP_END_MHZ = 2950
     SWEEP_STEP_MHZ = 1
     SCIENCE_FILE_HEADER = "mission_s,sweep,freq_mhz,contrast,photodiode_a"
+    # Never delete science data unless the card is nearly full (TODO B3); then the oldest file
+    # goes first, so the newest sweeps are the ones left to downlink.
+    SD_MIN_FREE_BYTES = 256 * 1024
 
     # Science / comms split (Q-S6, TODO B1). Measured in mission time (seconds since the burn):
     #   first SCIENCE_ONLY_S: 100% SCIENCE (the IARU agreement)
@@ -784,6 +797,29 @@ class QubeSatFSM:
             self.sd_card_initialized = False
             print("[SD] Init failed:", e)
 
+    def _sd_make_room(self):
+        """If the card is nearly full, delete the oldest science files (never the current one)."""
+        directory, _, current = self.log_file.rpartition("/")
+        free = _sd_free_bytes(directory)
+        if free is None or free >= self.SD_MIN_FREE_BYTES:
+            return
+        try:
+            old = sorted(n for n in os.listdir(directory) if n.startswith("mission") and n != current)
+        except Exception as e:
+            print("[SD] Could not list", directory, e)
+            return
+        for name in old:
+            try:
+                os.remove(directory + "/" + name)
+                print("[SD] Card nearly full; deleted oldest file", name)
+            except Exception as e:
+                print("[SD] Could not delete", name, e)
+                return
+            free = _sd_free_bytes(directory)
+            if free is None or free >= self.SD_MIN_FREE_BYTES:
+                return
+        print("[SD] Card nearly full and no older files left to delete.")
+
     def _task_record_memory(self):
         if self.latest_data is None:
             return
@@ -794,6 +830,7 @@ class QubeSatFSM:
             if not self.sd_card_initialized:
                 print("[DATA] SD not ready, skipping record.")
                 return
+        self._sd_make_room()
         sweep, freq, contrast, pd = self.latest_data
         c = "ERR" if contrast is None else f"{contrast:.4f}"
         p = "ERR" if pd is None else f"{pd:.4e}"

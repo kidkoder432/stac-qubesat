@@ -850,6 +850,40 @@ def test_radio_that_never_recovers_is_a_fault():
         Q.configure_radio = real
 
 
+def test_sd_nearly_full_deletes_oldest_file_only():
+    f, cm, radio = make()
+    with contextlib.redirect_stdout(io.StringIO()):
+        for _ in range(3):  # three older science files
+            f._task_init_sd_card()
+    older = _science_files()[:-1]
+    assert len(older) == 2
+    free = [0]  # pretend the card is full until two files are gone
+    real = Q._sd_free_bytes
+    Q._sd_free_bytes = lambda d: free[0] if len(_science_files()) > 2 else 10**9
+    try:
+        f.latest_data = (0, 2800, 0.1, 1e-6)
+        with contextlib.redirect_stdout(io.StringIO()):
+            f._task_record_memory()
+    finally:
+        Q._sd_free_bytes = real
+    left = _science_files()
+    assert os.path.basename(older[0]) not in [os.path.basename(p) for p in left], "oldest deleted"
+    assert os.path.basename(older[1]) in [os.path.basename(p) for p in left], "stopped once there was room"
+    assert os.path.basename(f.log_file) in [os.path.basename(p) for p in left], "current file never deleted"
+    assert len(_read_rows()) == 1, "the sample was still recorded"
+
+
+def test_sd_with_room_deletes_nothing():
+    f, cm, radio = make()
+    with contextlib.redirect_stdout(io.StringIO()):
+        for _ in range(3):
+            f._task_init_sd_card()
+        n = len(_science_files())
+        f.latest_data = (0, 2800, 0.1, 1e-6)
+        f._task_record_memory()
+    assert len(_science_files()) == n
+
+
 def test_real_run_loop():
     """Drives QubeSatFSM.run() itself (not a copy of its loop) for ~70 min of fake time."""
     f, cm, radio = make()
