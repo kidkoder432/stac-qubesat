@@ -9,7 +9,7 @@ from Task import Task
 
 # One import path for the hardware object, shared with Comms and BurnWire (see hardware.py).
 from hardware import cubesat
-from Comms import build_beacon_packet, configure_radio
+from Comms import build_beacon_packet
 
 import struct
 
@@ -846,10 +846,9 @@ class QubeSatFSM:
         try:
             vbatt = cubesat.battery_voltage
         except Exception:
-            vbatt = 0.0
-        temp = _temperature_c()
+            vbatt = None  # build_beacon_packet sends None as "unknown", not as 0
         pkt = build_beacon_packet(
-            self.state, vbatt, temp if temp is not None else 0.0, self.mission_time
+            self.state, vbatt, _temperature_c(), self.mission_time
         )
         if self.comms is None:
             print("[BEACON] (no comms attached)", pkt)
@@ -943,7 +942,7 @@ class QubeSatFSM:
         """
         freq = self.current_sweep_freq
         try:
-            pd = self.payload.read_photodiode()
+            pd = self.payload.read_photodiode() 
             contrast = self.payload.measure_contrast(freq, timeout=30.0)
         except Exception as e:
             print("[SCIENCE] Payload error:", e)
@@ -1004,7 +1003,7 @@ class QubeSatFSM:
         print(f"[RADIO] {errors} errors in a row; re-applying radio settings.")
         self.radio_reconfigs += 1
         try:
-            configure_radio()
+            self.comms.reconfigure()  # re-applies the profile and returns to FSK listening
             self.comms.radio_errors = 0  # the next RX/TX call decides if that worked
         except Exception as e:
             print("[RADIO] Reconfigure failed:", e)

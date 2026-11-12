@@ -122,6 +122,34 @@ m = types.ModuleType("PayloadUART")
 m.PayloadUART = lambda *a: FakePayload()
 sys.modules["PayloadUART"] = m
 
+# Comms drives the radio through DualModeRadio (FSK uplink, LoRa downlink). The real adapter
+# needs SX127x register access and is tested on its own in test_dual_mode_radio.py; here FSK
+# frames simply come from radio.rx, so these tests cover the FSM <-> Comms interface.
+_dm = types.ModuleType("DualModeRadio")
+_dm.LORA, _dm.FSK, _dm.MAX_FSK_PACKET = 0, 1, 63
+
+
+class _StubDualModeRadio:
+    def __init__(self, radio):
+        self.radio = radio
+        self.modulation = _dm.LORA
+
+    def set_modulation(self, modulation):
+        self.modulation = modulation
+
+    def send_packet(self, packet):
+        self.radio.tx.append(bytes(packet))
+        return True
+
+    def receive_packet(self, timeout=0.1):
+        if self.radio.fail:
+            raise RuntimeError("spi hang")
+        return self.radio.rx.pop(0) if self.radio.rx else None
+
+
+_dm.DualModeRadio = _StubDualModeRadio
+sys.modules["DualModeRadio"] = _dm
+
 import Comms as C  # noqa: E402
 import QubeSatFSM as Q  # noqa: E402
 from StateCodeGenerator import StateID  # noqa: E402
@@ -133,15 +161,32 @@ class Radio:
         self.rx, self.tx = [], []
         self.fail = False
 
-    def receive(self, timeout=0):
+    def receive(self, timeout=0, with_header=False):
         if self.fail:
             raise RuntimeError("spi hang")
         return self.rx.pop(0) if self.rx else None
 
-    def send(self, b):
+    def send(self, b, destination=None, node=None, identifier=None, flags=None, **kw):
+        """pycubed_rfm9x.send(): the RadioHead header goes in front. send_raw() feeds the first
+        4 bytes of our packet in as that header, so tx holds exactly the bytes on air."""
         if self.fail:
             raise RuntimeError("spi hang")
-        self.tx.append(bytes(b))
+        header = bytes([destination or 0, node or 0, identifier or 0, flags or 0])
+        self.tx.append(header + bytes(b))
+
+    # what configure_radio() calls on the chip
+    regs = None
+
+    def sleep(self):
+        pass
+
+    def idle(self):
+        pass
+
+    def _write_u8(self, address, value):
+        if self.regs is None:
+            self.regs = {}
+        self.regs[address] = value
 
 
 def reset_world():
@@ -201,7 +246,7 @@ def test_state_codes_match_comms():
 
 
 def test_radio_frequency_is_the_team_answer():
-    assert abs(C.FREQ_MHZ - 433.72) < 1e-9
+    assert abs(C.FREQ_MHZ - 437.42) < 1e-9
 
 
 def test_task_scheduling():
@@ -822,34 +867,47 @@ def test_comms_exception_does_not_kill_the_loop():
 def test_radio_errors_trigger_reconfigure_then_recover():
     f, cm, radio = make()
     calls = []
-    real = Q.configure_radio
-    Q.configure_radio = lambda: calls.append(1)
-    try:
-        radio.fail = True
-        step(f, cm, 1, 70)  # radio health runs every 60 s
-        assert cm.radio_errors >= 3 and not f.equipment_check["radio"]
-        assert calls, "radio settings should be re-applied"
-        radio.fail = False
-        step(f, cm, 1, 130)
-        assert cm.radio_errors == 0 and f.equipment_check["radio"] is True
-        assert f.radio_reconfigs == 0
-    finally:
-        Q.configure_radio = real
+    cm.reconfigure = lambda: calls.append(1)
+    radio.fail = True
+    step(f, cm, 1, 70)  # radio health runs every 60 s
+    assert cm.radio_errors >= 3 and not f.equipment_check["radio"]
+    assert calls, "radio settings should be re-applied"
+    radio.fail = False
+    step(f, cm, 1, 130)
+    assert cm.radio_errors == 0 and f.equipment_check["radio"] is True
+    assert f.radio_reconfigs == 0
 
 
 def test_radio_that_never_recovers_is_a_fault():
     f, cm, radio = make()
-    real = Q.configure_radio
-    Q.configure_radio = lambda: None  # reconfigure "works" but the radio stays broken
+    cm.reconfigure = lambda: None  # reconfigure "works" but the radio stays broken
+    radio.fail = True
     try:
-        radio.fail = True
-        try:
-            step(f, cm, 1, 60 * 6)
-            raise AssertionError("expected a fault")
-        except Q.FatalFault as e:
-            assert "radio" in str(e)
-    finally:
-        Q.configure_radio = real
+        step(f, cm, 1, 60 * 6)
+        raise AssertionError("expected a fault")
+    except Q.FatalFault as e:
+        assert "radio" in str(e)
+
+
+def test_beacon_sends_unknown_for_a_missing_sensor_not_zero():
+    f, cm, radio = make()
+    cubesat.temperature = None  # the IMU did not start
+    f._task_beacon()
+    pkt = cm._telem_q.pop()
+    assert pkt[9] == 0xFF, "temperature unknown"
+    assert pkt[7:9] == b"\x1f\xf8" or pkt[7] * 256 + pkt[8] == 8200, "battery still reported"
+    cubesat.temperature = 25.0
+
+
+def test_ground_command_equal_to_the_stored_state_still_reaches_the_fsm():
+    """The first command after boot often equals the stored code; a dedup in Comms would drop it."""
+    f, cm, radio = make()
+    assert cm.state_code == StateID.IDLE
+    step(f, cm, 10, 380)  # deployed; Comms still holds the code IDLE (the last ground command)
+    assert f.deployed and f.last_ground_contact is None
+    cmd(radio, StateID.IDLE)
+    step(f, cm, 1, 2)
+    assert f.last_ground_contact is not None, "the antenna watchdog must see the ground"
 
 
 def test_sd_nearly_full_deletes_oldest_file_only():

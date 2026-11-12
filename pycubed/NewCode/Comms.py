@@ -1,8 +1,15 @@
 """
 Comms.py  —  CubeSat communications system (CircuitPython / PyCubed).
 
+Merged from Tyler's `tinygs` branch (ArcticaNova/qubesat, last commit 8acfe8b: FSK uplink,
+LoRa downlink, send_raw, sync-word fix) plus these changes for the FSM:
+  - lock bit in CMD_SET_STATE and on_state_command(code, lock)
+  - no dedup in Comms (the FSM ignores a command for the state it is already in)
+  - radio_errors counter and reconfigure()
+  - frequency 437.42 MHz (team answer)
+
 Handles:
-  - Physical LoRa radio configuration via PyCubed (cubesat.radio1)
+  - FSK uplink listening and temporary LoRa downlink windows via cubesat.radio1
   - FSM state code persistence in NVM (3 copies, majority vote, checksum)
   - AES-128-ECB encrypted command packets with CRC-8 + complement verification
   - Alternating RX/TX schedule (RX = tick count, TX = packet count)
@@ -14,7 +21,8 @@ and must be kept in sync manually.
 """
 
 import time
-from hardware import cubesat
+from hardware import cubesat  # the one hardware import every module shares (see hardware.py)
+from DualModeRadio import DualModeRadio, LORA, FSK, MAX_FSK_PACKET
 
 # ── State codes ────────────────────────────────────────────────────────────────
 # Must stay in sync with StateID in StateCodeGenerator.py.
@@ -28,14 +36,15 @@ _VALID_CODES = (STATE_STOP, STATE_IDLE, STATE_DEPLOY, STATE_SCIENCE, STATE_COMMS
 
 # ── Radio hardware config ──────────────────────────────────────────────────────
 # These values must match exactly what is registered on https://tinygs.com for QubeSat.
-# Frequency from the team (Q-C2 in docs/FSM_SPEC.md). Confirm against the IARU coordination
-# and the callsign (still a placeholder) before flight.
-FREQ_MHZ         = 433.72
+# Confirm the frequency is within your IARU/FCC license before flight.
+FREQ_MHZ         = 437.42   # team answer (Q-C2); the FSK profile uses the same carrier registers
 SIGNAL_BW        = 125000
 SPREADING_FACTOR = 7
 CODING_RATE      = 5    # 4/5 — most common TinyGS coding rate; was 8 (4/8)
 PREAMBLE_LEN     = 8
 SYNC_WORD        = 0x12  # LoRa public-network sync word — required by TinyGS (decimal 18)
+_REG_SYNC_WORD   = 0x39  # SX127x sync word register (pycubed_rfm9x has no property for it)
+_BROADCAST       = 0xFF  # RadioHead "accept any address" value
 ENABLE_CRC       = True
 TX_POWER_DBM     = 5
 
@@ -142,7 +151,7 @@ def _encrypt(plaintext):
         out = bytearray(len(padded))
         c = aesio.AES(_AES_KEY, aesio.MODE_ECB)
         for i in range(0, len(padded), 16):
-            c.encrypt_into(padded[i:i + 16], out[i:i + 16])
+            c.encrypt_into(memoryview(padded)[i:i + 16], memoryview(out)[i:i + 16])
         return bytes(out)
     except ImportError:
         return bytes(b ^ _AES_KEY[i % 16] for i, b in enumerate(plaintext))
@@ -157,7 +166,7 @@ def _decrypt(ciphertext):
         out = bytearray(len(ciphertext))
         c = aesio.AES(_AES_KEY, aesio.MODE_ECB)
         for i in range(0, len(ciphertext), 16):
-            c.decrypt_into(ciphertext[i:i + 16], out[i:i + 16])
+            c.decrypt_into(memoryview(ciphertext)[i:i + 16], memoryview(out)[i:i + 16])
         return _pkcs7_unpad(out)
     except ImportError:
         return bytes(b ^ _AES_KEY[i % 16] for i, b in enumerate(ciphertext))
@@ -172,6 +181,23 @@ LOCK_BIT = 0x80  # top bit of the state byte in CMD_SET_STATE (state codes are 7
 
 CMD_SET_STATE  = 0x01
 CMD_SET_CONFIG = 0x02
+CMD_SET_MODULATION = 0x03
+
+
+def build_modulation_command(modulation, duration_s=60):
+    """Switch modem after receipt. LoRa lease is 1..255 seconds; FSK uses 0.
+
+    Send in the satellite's CURRENT mode, then retune the ground radio.
+    Repeated LoRa commands do not extend an existing lease.
+    """
+    if modulation not in (LORA, FSK):
+        raise ValueError("Expected LORA or FSK")
+    if modulation == LORA and not 1 <= duration_s <= 255:
+        raise ValueError("LoRa duration must be 1..255 seconds")
+    duration_s = duration_s if modulation == LORA else 0
+    body = bytes([CMD_SET_MODULATION, modulation, duration_s,
+                  (~modulation) & 0xFF])
+    return bytes([HDR_COMMAND]) + _encrypt(body + bytes([_crc8(body)]))
 
 
 # ── Ground station command builders ───────────────────────────────────────────
@@ -223,16 +249,19 @@ def build_beacon_packet(state_code, batt_v, temp_c, mission_time_s):
     Wire layout:
       [0-5]   callsign        6 bytes ASCII, space-padded
       [6]     state code      uint8
-      [7-8]   battery mV      uint16 big-endian  (e.g. 7400 → 7.400 V)
-      [9]     temperature     uint8, value = int(temp_C) + 40  (range -40..215 °C)
+      [7-8]   battery mV      uint16 big-endian  (e.g. 7400 → 7.400 V), 0 = unknown
+      [9]     temperature     uint8, value = int(temp_C) + 40  (range -40..214 °C), 0xFF = unknown
       [10-13] mission time    uint32 big-endian, seconds since boot
       [14]    CRC-8           over bytes 0-13
 
     Register these radio parameters and this field layout on https://tinygs.com
     so the network can decode and display your telemetry automatically.
+
+    batt_v / temp_c may be None (pycubed returns None when a sensor is down);
+    those fields are sent as their "unknown" values instead of crashing.
     """
-    batt_mv  = max(0, min(65535, int(batt_v * 1000)))
-    temp_raw = max(0, min(255, int(temp_c) + 40))
+    batt_mv  = 0 if batt_v is None else max(0, min(65535, int(batt_v * 1000)))
+    temp_raw = 0xFF if temp_c is None else max(0, min(254, int(temp_c) + 40))
     t        = max(0, min(0xFFFFFFFF, int(mission_time_s)))
 
     cs = CALLSIGN[:6].ljust(6).encode("ascii")  # always exactly 6 bytes
@@ -340,8 +369,11 @@ class CommsManager:
     _RX = 0
     _TX = 1
 
-    def __init__(self, radio):
+    def __init__(self, radio, default_modulation=FSK):
         self._radio      = radio
+        self._default_modulation = default_modulation
+        self._dual_radio = None
+        self._lora_deadline = None
         self._state_code = _nvm_read_state()
         self.config      = CommsConfig()
         self._mode       = self._RX
@@ -357,8 +389,53 @@ class CommsManager:
         self.on_state_command = None   # fn(new_state_code: int, lock: bool)
         self.on_tx_window     = None   # fn(window_num: int, cadence: int)
         self.on_amateur_rx    = None   # fn(payload: bytes)
+        self.set_modulation(default_modulation)
 
     # ── Public API ──────────────────────────────────────────────────────────────
+
+    @property
+    def modulation(self):
+        return LORA if self._dual_radio is None else self._dual_radio.modulation
+
+    def set_modulation(self, modulation, duration_s=60):
+        """Open a temporary LoRa window, or return to default FSK immediately.
+
+        configure_radio() prepares the LoRa profile; the manager starts in FSK.
+        Repeated LoRa requests do not extend the return-to-FSK deadline.
+        """
+        if modulation not in (LORA, FSK):
+            raise ValueError("Expected LORA or FSK")
+        if modulation == LORA and not 1 <= duration_s <= 255:
+            raise ValueError("LoRa duration must be 1..255 seconds")
+        if modulation == self.modulation:
+            return
+        if self._dual_radio is None:
+            self._dual_radio = DualModeRadio(self._radio)
+        self._dual_radio.set_modulation(modulation)
+        self._lora_deadline = (time.monotonic() + duration_s
+                               if modulation == LORA else None)
+        self._mode = self._RX
+        self._rx_elapsed = 0
+
+    def send_fsk(self, packet):
+        """Send application data during FSK (up to 63 bytes, including header)."""
+        if self.modulation != FSK:
+            raise RuntimeError("Return to FSK mode first")
+        if self.state_code == STATE_STOP:
+            raise RuntimeError("Transmission disabled in STOP")
+        return self._dual_radio.send_packet(packet)
+
+    def reconfigure(self):
+        """
+        Re-apply the radio profile (after repeated radio errors) and return to the default mode.
+        configure_radio() leaves the chip in LoRa, so the mode tracking is rebuilt from scratch.
+        """
+        configure_radio()
+        self._dual_radio = None
+        self._lora_deadline = None
+        self._mode = self._RX
+        self._rx_elapsed = 0
+        self.set_modulation(self._default_modulation)
 
     @property
     def state_code(self):
@@ -382,7 +459,7 @@ class CommsManager:
     def update(self):
         """
         Run one comms tick. Call this every FSM loop iteration.
-        No-op when state_code is 0 (halt).
+        FSK is the default RX mode; scheduled TX windows use LoRa for TinyGS.
 
         RX: advances tick counter each call, except when a command was received
             (command processing pauses the window — that tick is not counted).
@@ -392,6 +469,8 @@ class CommsManager:
         When state_code is 0 (STOP): RX-only — listens for a wake-up command
         but never transmits and never advances the RX/TX schedule.
         """
+        if self._lora_deadline is not None and time.monotonic() >= self._lora_deadline:
+            self.set_modulation(FSK)
         if self._state_code == 0:
             self._rx_tick()   # stay alive so ground can send a non-zero state command
             return
@@ -414,11 +493,14 @@ class CommsManager:
     # ── Internal ────────────────────────────────────────────────────────────────
 
     def _enter_rx(self):
+        self.set_modulation(FSK)
         self._mode = self._RX
         self._rx_elapsed = 0
         self._tx_windows += 1
 
     def _enter_tx(self):
+        # TinyGS downlinks use LoRa; uplink listening resumes in FSK afterwards.
+        self.set_modulation(LORA)
         self._mode = self._TX
         self._tx_sent = 0
         if self.on_tx_window is not None:
@@ -490,7 +572,9 @@ class CommsManager:
                 print("[COMMS] Unrecognized state code:", new_code)
                 return
             # No dedup: the ground spams a code and every copy is passed to the FSM, which
-            # treats a command for the current state as a no-op (see Q-H8, Q-G5, Q-C10).
+            # treats a command for the current state as a no-op. (A dedup against the stored
+            # code would also swallow a command that matches it even though the FSM has since
+            # moved on, and the first command heard after boot.)
             self.state_code = new_code   # writes to all 3 NVM copies + checksum, only on change
             print("[COMMS] State ->", new_code, "lock" if lock else "unlock")
             if self.on_state_command is not None:
@@ -504,12 +588,26 @@ class CommsManager:
             print("[COMMS] Config: rx=%d tx=%d cad=%d" % (
                 self.config.rx_ticks, self.config.tx_packet_count, self.config.telem_cadence))
 
+        elif cmd == CMD_SET_MODULATION:
+            if len(plaintext) != 5:
+                print("[COMMS] Invalid modulation command length")
+                return
+            try:
+                self.set_modulation(plaintext[1], plaintext[2])
+                print("[COMMS] Modulation ->", self.modulation)
+            except Exception as e:
+                print("[COMMS] Modulation change failed:", e)
+
         else:
             print("[COMMS] Unknown command type:", cmd)
 
     def _receive(self):
         try:
-            raw = self._radio.receive(timeout=0.1)
+            if self.modulation == FSK:
+                raw = self._dual_radio.receive_packet(timeout=0.1)
+            else:
+                # with_header=True: return the bytes exactly as they were on air (see send_raw)
+                raw = self._radio.receive(timeout=0.1, with_header=True)
             self.radio_errors = 0
             return raw
         except Exception as e:
@@ -519,7 +617,7 @@ class CommsManager:
 
     def _send(self, header, payload):
         try:
-            self._radio.send(bytes([header]) + payload)
+            send_raw(self._radio, bytes([header]) + payload)
             self.radio_errors = 0
         except Exception as e:
             self.radio_errors = min(self.radio_errors + 1, 255)
@@ -531,15 +629,42 @@ def configure_radio():
     if not cubesat.hardware["Radio1"]:
         raise RuntimeError("Radio1 did not initialize")
     r = cubesat.radio1
+    # Prepare the LoRa profile; CommsManager switches to FSK for uplink at startup.
+    r.sleep()
+    time.sleep(0.01)
+    r.long_range_mode = True
+    r.idle()
     r.frequency_mhz   = FREQ_MHZ
     r.signal_bandwidth = SIGNAL_BW
     r.spreading_factor = SPREADING_FACTOR
     r.coding_rate      = CODING_RATE
     r.preamble_length  = PREAMBLE_LEN
-    r.node             = SYNC_WORD   # sets sync word; required for TinyGS to receive packets
     r.enable_crc       = ENABLE_CRC
     r.tx_power         = TX_POWER_DBM
+    r._write_u8(_REG_SYNC_WORD, SYNC_WORD)   # required for TinyGS to receive packets
+    # `node` is a RadioHead address filter, not the sync word. Broadcast = accept
+    # every packet; Comms does its own filtering by header byte.
+    r.node             = _BROADCAST
     return r
+
+
+def send_raw(radio, packet):
+    """
+    Transmit `packet` so the bytes on air are exactly `packet`.
+
+    pycubed_rfm9x.send() always prepends a 4-byte RadioHead header
+    (destination, node, identifier, flags). Feeding the first 4 bytes of our
+    packet in as those header fields makes the on-air bytes match our layout,
+    which TinyGS and tinygs_decoder.py expect. Packets shorter than 5 bytes are
+    zero-padded (the driver needs at least 1 byte after the header).
+
+    Ground stations using pycubed_rfm9x should send commands with this too.
+    """
+    packet = bytes(packet)
+    if len(packet) < 5:
+        packet = packet + bytes(5 - len(packet))
+    return radio.send(packet[4:], destination=packet[0], node=packet[1],
+                      identifier=packet[2], flags=packet[3])
 
 
 def print_status(r):
