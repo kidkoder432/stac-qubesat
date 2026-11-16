@@ -25,6 +25,7 @@ Cancelling a long operation: press Enter (any key on the board) to stop after th
 or Ctrl-C to stop immediately. Heaters are always switched off again when a heater run ends.
 """
 
+import gc
 import struct
 import sys
 import time
@@ -48,7 +49,9 @@ class MockUARTBridge:
         self.baudrate = 115200
         self._heat = 0.0  # fake warming: rises on each RTD read while a heater is on
 
-    def deinit(self):  # PayloadUART re-creates the UART on the board; nothing to do here
+    def deinit(
+        self,
+    ):  # PayloadUART re-creates the UART on the board; nothing to do here
         pass
 
     def write(self, data: bytes):
@@ -139,7 +142,7 @@ def init_payload():
     """Initializes the PayloadUART driver with real hardware or mock fallback."""
     sat = None
     try:
-        from hardware import cubesat  # the one hardware import every module shares
+        from pycubed import cubesat  # the one hardware import every module shares
 
         sat = cubesat
         if getattr(sat, "uart", None) is not None:
@@ -222,9 +225,7 @@ def test_photodiode():
         if 1e-10 <= val <= 5e-7:
             print("  Status: Within expected operational range")
         else:
-            print(
-                "  Notice: Value outside nominal range (verify optical excitation)"
-            )
+            print("  Notice: Value outside nominal range (verify optical excitation)")
         return True
     else:
         print("✗ Photodiode measurement failed or timed out")
@@ -381,7 +382,9 @@ def _print_hw_state():
     if not st:
         print("✗ Could not read hardware status")
         return None
-    print(f"  Rails:   5V {'ON' if st['v5_rail'] else 'OFF'} | 10V {'ON' if st['10v_rail'] else 'OFF'}")
+    print(
+        f"  Rails:   5V {'ON' if st['v5_rail'] else 'OFF'} | 10V {'ON' if st['10v_rail'] else 'OFF'}"
+    )
     print(
         "  Heaters: "
         + " | ".join(f"IN{n} {'ON' if st[f'in{n}'] else 'OFF'}" for n in (1, 2, 3, 4))
@@ -395,7 +398,9 @@ def _set_heater_checked(n, on):
     st = payload.get_status()
     actual = None if not st else st[f"in{n}"]
     if ok and actual == on:
-        print(f"✓ Heater IN{n} is {'ON' if on else 'OFF'} (confirmed by status readback)")
+        print(
+            f"✓ Heater IN{n} is {'ON' if on else 'OFF'} (confirmed by status readback)"
+        )
         return True
     print(
         f"✗ Heater IN{n} -> {'ON' if on else 'OFF'} not confirmed "
@@ -410,7 +415,11 @@ def _all_heaters_off():
         ok = payload.set_heater(n, False) and ok
     st = payload.get_status()
     confirmed = bool(st) and not any(st[f"in{n}"] for n in (1, 2, 3, 4))
-    print("✓ All heaters OFF (confirmed)" if (ok and confirmed) else "✗ Could not confirm all heaters are OFF")
+    print(
+        "✓ All heaters OFF (confirmed)"
+        if (ok and confirmed)
+        else "✗ Could not confirm all heaters are OFF"
+    )
     return ok and confirmed
 
 
@@ -424,9 +433,15 @@ def _heater_run(n):
         _all_heaters_off()
         return False
 
-    print("Press Enter (any key on the board) to stop, or Ctrl-C. The heater is switched OFF on exit.")
-    print("\n t (s) | heater | RTD temperatures (°C)                              | biggest rise since start")
-    print("-------+--------+----------------------------------------------------+-------------------------")
+    print(
+        "Press Enter (any key on the board) to stop, or Ctrl-C. The heater is switched OFF on exit."
+    )
+    print(
+        "\n t (s) | heater | RTD temperatures (°C)                              | biggest rise since start"
+    )
+    print(
+        "-------+--------+----------------------------------------------------+-------------------------"
+    )
     start = time.monotonic()
     first = None
     try:
@@ -441,9 +456,13 @@ def _heater_run(n):
                 rises = [t - f0 for t, f0 in zip(temps, first)]
                 k = max(range(len(rises)), key=lambda i: rises[i])
                 shown = " ".join(f"{t:5.1f}" for t in temps)
-                print(f" {time.monotonic() - start:5.0f} |  {heater}   | {shown} | {rises[k]:+.2f} °C (RTD{k + 1})")
+                print(
+                    f" {time.monotonic() - start:5.0f} |  {heater}   | {shown} | {rises[k]:+.2f} °C (RTD{k + 1})"
+                )
             else:
-                print(f" {time.monotonic() - start:5.0f} |  {heater}   | RTD read failed")
+                print(
+                    f" {time.monotonic() - start:5.0f} |  {heater}   | RTD read failed"
+                )
             if _wait_or_cancel(interval):
                 print("Cancelled by user.")
                 break
@@ -461,7 +480,9 @@ def _heater_run(n):
 def test_heaters():
     print("\n--- [7] Thermal Heaters IN1..IN4 ---")
     while True:
-        print("\nHeaters:  [s] show state   [1-4] set a heater (with readback)   [a] all OFF")
+        print(
+            "\nHeaters:  [s] show state   [1-4] set a heater (with readback)   [a] all OFF"
+        )
         print("          [r] run a heater with a live RTD monitor   [b] back")
         choice = input("heaters> ").strip().lower()
         if choice in ("", "b", "back", "q"):
@@ -474,7 +495,9 @@ def test_heaters():
             n = int(choice)
             st = payload.get_status()
             current = bool(st and st[f"in{n}"])
-            raw = input(f"Set Heater IN{n} [1 = ON, 0 = OFF, Enter = toggle (now {'ON' if current else 'OFF'})]: ").strip()
+            raw = input(
+                f"Set Heater IN{n} [1 = ON, 0 = OFF, Enter = toggle (now {'ON' if current else 'OFF'})]: "
+            ).strip()
             on = (raw == "1") if raw in ("0", "1") else (not current)
             _set_heater_checked(n, on)
         elif choice == "r":
@@ -515,18 +538,22 @@ def test_single_contrast(freq: int = None):
 
 # ======================= SWEEPS, PHOTODIODE, RTD MONITOR =======================
 
-last_sweep = {}  # result of the most recent sweep, for inspection from the REPL (test_payload.last_sweep)
+last_sweep = (
+    {}
+)  # result of the most recent sweep, for inspection from the REPL (test_payload.last_sweep)
 
 
 def _open_log(total, with_pd):
     try:
         fh = open(LOG_PATH, "a")
         fh.write(f"# ODMR sweep start: {time.monotonic()} | Points: {total}\n")
-        fh.write("freq_mhz,contrast,photodiode_a\n" if with_pd else "freq_mhz,contrast\n")
+        fh.write(
+            "freq_mhz,contrast,photodiode_a\n" if with_pd else "freq_mhz,contrast\n"
+        )
         print(f"✓ Logging sweep points to {LOG_PATH}")
         return fh
-    except Exception:
-        print("Notice: SD card not available for file logging (console only)")
+    except Exception as e:
+        print("Notice: SD card not available for file logging (console only):", repr(e))
         return None
 
 
@@ -538,13 +565,20 @@ def _run_sweep(frequencies, with_pd=True, timeout=30.0):
     """
     global last_sweep
     total = len(frequencies)
-    print(f"Sweep: {total} points, {frequencies[0]} to {frequencies[-1]} MHz, per-point timeout {timeout:.0f} s.")
-    print("Press Enter (any key on the board) to cancel after the current point, or Ctrl-C to stop now.")
+    print(
+        f"Sweep: {total} points, {frequencies[0]} to {frequencies[-1]} MHz, per-point timeout {timeout:.0f} s."
+    )
+    print(
+        "Press Enter (any key on the board) to cancel after the current point, or Ctrl-C to stop now."
+    )
+    gc.collect()  # the board's heap is small; start the sweep with it as unfragmented as possible
     log = _open_log(total, with_pd)
 
-    rows = []  # (freq, contrast, photodiode or None)
+    rows = [None] * total  # preallocated so it never has to grow mid-sweep; (freq, contrast, photodiode)
+    n_rows = 0
     failed = 0
-    latencies = []
+    lat_sum = 0.0
+    lat_max = 0.0
     cancelled = False
     print("\nFreq (MHz) | Contrast | Photodiode (A) | Latency | Progress")
     print("-----------+----------+----------------+---------+-------------------")
@@ -562,21 +596,33 @@ def _run_sweep(frequencies, with_pd=True, timeout=30.0):
             bar = "=" * (pct // 10) + " " * (10 - pct // 10)
             if c is None:
                 failed += 1
-                print(f" {f:4d} MHz  |  FAILED  |       -        | {dt:5.1f} s | [{bar}] {pct}%")
+                print(
+                    f" {f:4d} MHz  |  FAILED  |       -        | {dt:5.1f} s | [{bar}] {pct}%"
+                )
                 continue
-            latencies.append(dt)
-            rows.append((f, c, pd))
-            pd_txt = "      ERR       " if (with_pd and pd is None) else (f" {pd:.4e}   " if with_pd else "       -        ")
+            lat_sum += dt
+            lat_max = max(lat_max, dt)
+            rows[n_rows] = (f, c, pd)
+            n_rows += 1
+            if n_rows % 10 == 0:
+                gc.collect()
+            pd_txt = (
+                "      ERR       "
+                if (with_pd and pd is None)
+                else (f" {pd:.4e}   " if with_pd else "       -        ")
+            )
             print(f" {f:4d} MHz  |  {c:6.4f}  |{pd_txt}| {dt:5.1f} s | [{bar}] {pct}%")
             if log:
                 try:
                     if with_pd:
-                        log.write(f"{f},{c:.4f},{'ERR' if pd is None else format(pd, '.4e')}\n")
+                        pd_s = "ERR" if pd is None else f"{pd:.4e}"
+                        log.write(f"{f},{c:.4f},{pd_s}\n")
                     else:
                         log.write(f"{f},{c:.4f}\n")
                     log.flush()
-                except Exception:
-                    pass
+                except Exception as e:
+                    print("  (log write failed, console only from here:", repr(e), ")")
+                    log = None
     except KeyboardInterrupt:
         cancelled = True
         _drain_uart()
@@ -589,6 +635,8 @@ def _run_sweep(frequencies, with_pd=True, timeout=30.0):
                 pass
 
     elapsed = time.monotonic() - t_start
+    rows = rows[:n_rows]
+    gc.collect()
     last_sweep = {
         "rows": rows,
         "failed": failed,
@@ -601,14 +649,18 @@ def _run_sweep(frequencies, with_pd=True, timeout=30.0):
         f"{'✗ Sweep CANCELLED' if cancelled else '✓ Sweep complete'}: {len(rows)}/{total} points captured, "
         f"{failed} failed, {elapsed:.1f} s"
     )
-    if latencies:
-        print(f"  Per-point time: mean {sum(latencies) / len(latencies):.2f} s, max {max(latencies):.2f} s")
+    if n_rows:
+        print(
+            f"  Per-point time: mean {lat_sum / n_rows:.2f} s, max {lat_max:.2f} s"
+        )
     if rows:
         f_min, c_min, _ = min(rows, key=lambda r: r[1])
         print(f"  Minimum contrast {c_min:.4f} at {f_min} MHz")
         line = _sparkline([r[1] for r in rows])
         if line:
-            print(f"  contrast   [{line}]  (' ' lowest ... '@' highest; {rows[0][0]}..{rows[-1][0]} MHz)")
+            print(
+                f"  contrast   [{line}]  (' ' lowest ... '@' highest; {rows[0][0]}..{rows[-1][0]} MHz)"
+            )
         pds = [r[2] for r in rows]
         if any(v is not None for v in pds):
             line = _sparkline(pds)
@@ -618,7 +670,9 @@ def _run_sweep(frequencies, with_pd=True, timeout=30.0):
 
 
 def test_full_sweep():
-    print("\n--- [F] FULL ODMR sweep 2800..2950 MHz, 1 MHz steps (contrast + photodiode per point) ---")
+    print(
+        "\n--- [F] FULL ODMR sweep 2800..2950 MHz, 1 MHz steps (contrast + photodiode per point) ---"
+    )
     return _run_sweep(list(range(2800, 2951)), with_pd=True, timeout=30.0)
 
 
@@ -630,12 +684,16 @@ def test_odmr_sweep():
     if None in (f_start, f_stop, f_step) or f_start > f_stop:
         print("Invalid frequency range or step size")
         return False
-    return _run_sweep(list(range(f_start, f_stop + 1, f_step)), with_pd=False, timeout=10.0)
+    return _run_sweep(
+        list(range(f_start, f_stop + 1, f_step)), with_pd=False, timeout=10.0
+    )
 
 
 def test_photodiode_stream():
     print("\n--- [P] Photodiode stream ---")
-    count = _ask_number("Number of readings (0 = until cancelled)", 20, 0, 100000, as_int=True)
+    count = _ask_number(
+        "Number of readings (0 = until cancelled)", 20, 0, 100000, as_int=True
+    )
     interval = _ask_number("Seconds between readings", 0.5, 0.0, 60)
     if count is None or interval is None:
         return False
@@ -660,7 +718,9 @@ def test_photodiode_stream():
     if vals:
         mean = sum(vals) / len(vals)
         spread = (sum((x - mean) ** 2 for x in vals) / len(vals)) ** 0.5
-        print(f"✓ {len(vals)} readings ({failed} failed): min {min(vals):.4e}  max {max(vals):.4e}  mean {mean:.4e}  std {spread:.2e} A")
+        print(
+            f"✓ {len(vals)} readings ({failed} failed): min {min(vals):.4e}  max {max(vals):.4e}  mean {mean:.4e}  std {spread:.2e} A"
+        )
     else:
         print("✗ No successful readings")
     return bool(vals)
@@ -668,7 +728,9 @@ def test_photodiode_stream():
 
 def test_rtd_monitor():
     print("\n--- [T] RTD monitor ---")
-    count = _ask_number("Number of readings (0 = until cancelled)", 10, 0, 100000, as_int=True)
+    count = _ask_number(
+        "Number of readings (0 = until cancelled)", 10, 0, 100000, as_int=True
+    )
     interval = _ask_number("Seconds between readings", 2, 0.0, 600)
     if count is None or interval is None:
         return False
@@ -718,7 +780,10 @@ def run_automated_selftest():
         ("5. Read RTD Sensors", test_rtds),
         ("6. Enable 10V Microwave Rail", lambda: payload.set_rail(10, True)),
         ("7. Single ODMR Point (2870 MHz)", lambda: test_single_contrast(2870)),
-        ("8. Disable Power Rails", lambda: payload.set_rail(5, False) and payload.set_rail(10, False)),
+        (
+            "8. Disable Power Rails",
+            lambda: payload.set_rail(5, False) and payload.set_rail(10, False),
+        ),
     ]
 
     results = []
@@ -751,9 +816,7 @@ def run_automated_selftest():
 
 def print_menu():
     mode_str = (
-        "[MOCK DESKTOP SIMULATION]"
-        if is_mock
-        else "[CONNECTED TO HARDWARE CUBESAT]"
+        "[MOCK DESKTOP SIMULATION]" if is_mock else "[CONNECTED TO HARDWARE CUBESAT]"
     )
     print("\n========================================================")
     print("       PyCubed <-> Payload Interactive Test Suite       ")
@@ -781,9 +844,7 @@ def run():
     print_menu()
     while True:
         try:
-            choice = (
-                input("\npycubed-test> ").strip().upper()  # noqa: F821
-            )
+            choice = input("\npycubed-test> ").strip().upper()  # noqa: F821
             if not choice:
                 continue
 
@@ -816,9 +877,7 @@ def run():
             elif choice == "M" or choice == "?":
                 print_menu()
             elif choice in ("Q", "QUIT", "EXIT"):
-                print(
-                    "\nExiting test suite. Returned to CircuitPython REPL (>>>)."
-                )
+                print("\nExiting test suite. Returned to CircuitPython REPL (>>>).")
                 print("Type 'test_payload.run()' anytime to re-open the menu.")
                 break
             else:
@@ -834,9 +893,10 @@ def run():
 
 
 # Run automatically when imported on CircuitPython, or when run directly
-if hasattr(sys, "implementation") and getattr(
-    sys.implementation, "name", ""
-) in ("circuitpython", "micropython"):
+if hasattr(sys, "implementation") and getattr(sys.implementation, "name", "") in (
+    "circuitpython",
+    "micropython",
+):
     run()
 elif __name__ == "__main__":
     run()
