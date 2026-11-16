@@ -1,10 +1,13 @@
 import time
-
-import board 
+import board
+import pycubed
 import digitalio
 import pwmio
+import microcontroller
 
-from hardware import cubesat  # shared with Comms and the FSM (see hardware.py)
+print(
+    "Reset reason:", microcontroller.cpu.reset_reason
+)  # tells us the reason for previous failure if necessary
 
 
 class BurnWire:
@@ -13,8 +16,8 @@ class BurnWire:
     isBurning = False  # turn to not isBurning once started and then not isBurning after the necessary time runs (30 min i think
 
     def __init__(self):
-        cubesat._relayA.drive_mode = digitalio.DriveMode.PUSH_PULL
-        cubesat._relayA.value = True
+        pycubed.cubesat._relayA.drive_mode = digitalio.DriveMode.PUSH_PULL
+        pycubed.cubesat._relayA.value = True
 
     def burningCheck(self):
         if self.isBurning == False:
@@ -27,8 +30,6 @@ class BurnWire:
             burnwire = pwmio.PWMOut(board.BURN1, frequency=self.freq, duty_cycle=0)
         elif burn_num == "2":
             burnwire = pwmio.PWMOut(board.BURN2, frequency=self.freq, duty_cycle=0)
-        else:
-            raise ValueError("Invalid burn number")
 
         burnwire.duty_cycle = int((dutycycle / 100) * (0xFFFF))
         print(f"Wire {burn_num} has started burning")
@@ -41,13 +42,17 @@ class BurnWire:
             )
             time.sleep(0.5)
 
-        time.sleep(300)
+        print(microcontroller.cpu.reset_reason)
+
+        time.sleep(
+            300
+        )  # I don't remember the exact reason why we chose to leave the burnwire system on for another five minutes after reaching max designated dutycycle tbh
         print(f"Wire {burn_num} has finished burning")
 
         self.isBurning = False
         burnwire.duty_cycle = 0
         burnwire.deinit()
-        cubesat._relayA.drive_mode = digitalio.DriveMode.OPEN_DRAIN
+        pycubed.cubesat._relayA.drive_mode = digitalio.DriveMode.OPEN_DRAIN
 
     def turnOff(self, burn_num):
         self.cubesatBurn(burn_num, 0, 0)
@@ -55,12 +60,8 @@ class BurnWire:
 
 def BurnWireObject():
     e = BurnWire()
-    e.cubesatBurn("2", 100, 30)
+    e.cubesatBurn("2", 2, 30)
 
 
 if __name__ == "__main__":
     BurnWireObject()
-
-# initial test should be the following:
-# from pycubed import cubesat
-# cubesatBurn("1", 0.05, 1)
