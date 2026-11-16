@@ -21,32 +21,38 @@ and must be kept in sync manually.
 """
 
 import time
-from hardware import cubesat  # the one hardware import every module shares (see hardware.py)
+from pycubed import (
+    cubesat,
+)  # the one hardware import every module shares (see hardware.py)
 from DualModeRadio import DualModeRadio, LORA, FSK, MAX_FSK_PACKET
 
 # ── State codes ────────────────────────────────────────────────────────────────
 # Must stay in sync with StateID in StateCodeGenerator.py.
-STATE_STOP    = 0   # halt all transmission; RX stays active so a non-zero command can wake it
-STATE_IDLE    = 1   # 0b001
-STATE_DEPLOY  = 2   # 0b010
-STATE_SCIENCE = 3   # 0b011
-STATE_COMMS   = 4   # 0b100  (downlink / ground contact window)
+STATE_STOP = (
+    0  # halt all transmission; RX stays active so a non-zero command can wake it
+)
+STATE_IDLE = 1  # 0b001
+STATE_DEPLOY = 2  # 0b010
+STATE_SCIENCE = 3  # 0b011
+STATE_COMMS = 4  # 0b100  (downlink / ground contact window)
 
 _VALID_CODES = (STATE_STOP, STATE_IDLE, STATE_DEPLOY, STATE_SCIENCE, STATE_COMMS)
 
 # ── Radio hardware config ──────────────────────────────────────────────────────
 # These values must match exactly what is registered on https://tinygs.com for QubeSat.
 # Confirm the frequency is within your IARU/FCC license before flight.
-FREQ_MHZ         = 437.42   # team answer (Q-C2); the FSK profile uses the same carrier registers
-SIGNAL_BW        = 125000
+FREQ_MHZ = 437.42  # team answer (Q-C2); the FSK profile uses the same carrier registers
+SIGNAL_BW = 125000
 SPREADING_FACTOR = 7
-CODING_RATE      = 5    # 4/5 — most common TinyGS coding rate; was 8 (4/8)
-PREAMBLE_LEN     = 8
-SYNC_WORD        = 0x12  # LoRa public-network sync word — required by TinyGS (decimal 18)
-_REG_SYNC_WORD   = 0x39  # SX127x sync word register (pycubed_rfm9x has no property for it)
-_BROADCAST       = 0xFF  # RadioHead "accept any address" value
-ENABLE_CRC       = True
-TX_POWER_DBM     = 5
+CODING_RATE = 5  # 4/5 — most common TinyGS coding rate; was 8 (4/8)
+PREAMBLE_LEN = 8
+SYNC_WORD = 0x12  # LoRa public-network sync word — required by TinyGS (decimal 18)
+_REG_SYNC_WORD = (
+    0x39  # SX127x sync word register (pycubed_rfm9x has no property for it)
+)
+_BROADCAST = 0xFF  # RadioHead "accept any address" value
+ENABLE_CRC = True
+TX_POWER_DBM = 5
 
 # ── NVM layout (bytes 20–26) ───────────────────────────────────────────────────
 # pycubed.py already uses bytes 0, 6, 7, 9, 10, 11 and 16 — keep clear of those.
@@ -55,19 +61,20 @@ TX_POWER_DBM     = 5
 #  24   : config rx_ticks
 #  25   : config tx_packet_count
 #  26   : config telem_cadence
-_NVM_S1      = 20
-_NVM_S2      = 21
-_NVM_S3      = 22
-_NVM_CS      = 23
-_NVM_CFG_RX  = 24
-_NVM_CFG_TX  = 25
+_NVM_S1 = 20
+_NVM_S2 = 21
+_NVM_S3 = 22
+_NVM_CS = 23
+_NVM_CFG_RX = 24
+_NVM_CFG_TX = 25
 _NVM_CFG_CAD = 26
 
 try:
     import microcontroller
+
     _nvm = microcontroller.nvm
 except ImportError:
-    _nvm = bytearray(256)   # desktop emulation fallback
+    _nvm = bytearray(256)  # desktop emulation fallback
 
 
 def _nvm_write_state(code):
@@ -99,14 +106,14 @@ def _nvm_read_state():
         return s2
     for candidate in (s1, s2, s3):
         if candidate == expected:
-            _nvm_write_state(candidate)   # restore all three from the valid copy
+            _nvm_write_state(candidate)  # restore all three from the valid copy
             return candidate
-    return 0   # all three corrupt — halt
+    return 0  # all three corrupt — halt
 
 
 def _nvm_write_config(rx, tx, cad):
-    _nvm[_NVM_CFG_RX]  = rx  & 0xFF
-    _nvm[_NVM_CFG_TX]  = tx  & 0xFF
+    _nvm[_NVM_CFG_RX] = rx & 0xFF
+    _nvm[_NVM_CFG_TX] = tx & 0xFF
     _nvm[_NVM_CFG_CAD] = cad & 0xFF
 
 
@@ -128,7 +135,7 @@ def _crc8(data):
 # ── Encryption ─────────────────────────────────────────────────────────────────
 # AES-128-ECB + PKCS7 padding. ECB is appropriate because every command is a
 # single packet, so there is no multi-block context to leak via identical IVs.
-_AES_KEY = b'\x00' * 16   # REPLACE with actual 16-byte pre-shared key before flight
+_AES_KEY = b"\x00" * 16  # REPLACE with actual 16-byte pre-shared key before flight
 
 
 def _pkcs7_pad(data):
@@ -139,7 +146,7 @@ def _pkcs7_pad(data):
 def _pkcs7_unpad(data):
     pad = data[-1]
     if pad < 1 or pad > 16:
-        return b''
+        return b""
     return bytes(data[:-pad])
 
 
@@ -147,11 +154,12 @@ def _encrypt(plaintext):
     """AES-128-ECB encrypt. Called by the ground station to build command packets."""
     try:
         import aesio
+
         padded = _pkcs7_pad(plaintext)
         out = bytearray(len(padded))
         c = aesio.AES(_AES_KEY, aesio.MODE_ECB)
         for i in range(0, len(padded), 16):
-            c.encrypt_into(memoryview(padded)[i:i + 16], memoryview(out)[i:i + 16])
+            c.encrypt_into(memoryview(padded)[i : i + 16], memoryview(out)[i : i + 16])
         return bytes(out)
     except ImportError:
         return bytes(b ^ _AES_KEY[i % 16] for i, b in enumerate(plaintext))
@@ -161,25 +169,28 @@ def _decrypt(ciphertext):
     """AES-128-ECB decrypt. Called by the satellite to parse incoming commands."""
     try:
         import aesio
+
         if len(ciphertext) % 16 != 0:
-            return b''
+            return b""
         out = bytearray(len(ciphertext))
         c = aesio.AES(_AES_KEY, aesio.MODE_ECB)
         for i in range(0, len(ciphertext), 16):
-            c.decrypt_into(memoryview(ciphertext)[i:i + 16], memoryview(out)[i:i + 16])
+            c.decrypt_into(
+                memoryview(ciphertext)[i : i + 16], memoryview(out)[i : i + 16]
+            )
         return _pkcs7_unpad(out)
     except ImportError:
         return bytes(b ^ _AES_KEY[i % 16] for i, b in enumerate(ciphertext))
 
 
 # ── Packet headers and command types ──────────────────────────────────────────
-HDR_COMMAND   = 0xC0   # uplink: encrypted command, one packet max
-HDR_TELEMETRY = 0xD0   # downlink: telemetry
-HDR_AMATEUR   = 0xA0   # bi-directional: amateur / ham radio
+HDR_COMMAND = 0xC0  # uplink: encrypted command, one packet max
+HDR_TELEMETRY = 0xD0  # downlink: telemetry
+HDR_AMATEUR = 0xA0  # bi-directional: amateur / ham radio
 
 LOCK_BIT = 0x80  # top bit of the state byte in CMD_SET_STATE (state codes are 7-bit)
 
-CMD_SET_STATE  = 0x01
+CMD_SET_STATE = 0x01
 CMD_SET_CONFIG = 0x02
 CMD_SET_MODULATION = 0x03
 
@@ -195,8 +206,7 @@ def build_modulation_command(modulation, duration_s=60):
     if modulation == LORA and not 1 <= duration_s <= 255:
         raise ValueError("LoRa duration must be 1..255 seconds")
     duration_s = duration_s if modulation == LORA else 0
-    body = bytes([CMD_SET_MODULATION, modulation, duration_s,
-                  (~modulation) & 0xFF])
+    body = bytes([CMD_SET_MODULATION, modulation, duration_s, (~modulation) & 0xFF])
     return bytes([HDR_COMMAND]) + _encrypt(body + bytes([_crc8(body)]))
 
 
@@ -215,7 +225,7 @@ def build_state_command(state_code, lock=False):
     """
     if state_code not in _VALID_CODES:
         raise ValueError("Invalid state code: " + str(state_code))
-    arg  = (state_code & 0x7F) | (LOCK_BIT if lock else 0)
+    arg = (state_code & 0x7F) | (LOCK_BIT if lock else 0)
     body = bytes([CMD_SET_STATE, arg, (~arg) & 0xFF])
     return bytes([HDR_COMMAND]) + _encrypt(body + bytes([_crc8(body)]))
 
@@ -226,16 +236,22 @@ def build_config_command(rx_ticks, tx_packet_count, telem_cadence):
 
     Wire format: [HDR_COMMAND] | AES( [0x02][rx][tx][cad][~rx][crc8_of_first_5] )
     """
-    body = bytes([CMD_SET_CONFIG,
-                  rx_ticks & 0xFF, tx_packet_count & 0xFF, telem_cadence & 0xFF,
-                  (~rx_ticks) & 0xFF])
+    body = bytes(
+        [
+            CMD_SET_CONFIG,
+            rx_ticks & 0xFF,
+            tx_packet_count & 0xFF,
+            telem_cadence & 0xFF,
+            (~rx_ticks) & 0xFF,
+        ]
+    )
     return bytes([HDR_COMMAND]) + _encrypt(body + bytes([_crc8(body)]))
 
 
 # ── TinyGS callsign and beacon packet ─────────────────────────────────────────
 # Replace with your FCC/ITU-assigned amateur radio callsign before flight.
 # This must match exactly what you register on https://tinygs.com
-CALLSIGN = "STAC  "   # 6 ASCII characters, space-padded on the right
+CALLSIGN = "STAC  "  # 6 ASCII characters, space-padded on the right
 
 
 def build_beacon_packet(state_code, batt_v, temp_c, mission_time_s):
@@ -260,9 +276,9 @@ def build_beacon_packet(state_code, batt_v, temp_c, mission_time_s):
     batt_v / temp_c may be None (pycubed returns None when a sensor is down);
     those fields are sent as their "unknown" values instead of crashing.
     """
-    batt_mv  = 0 if batt_v is None else max(0, min(65535, int(batt_v * 1000)))
+    batt_mv = 0 if batt_v is None else max(0, min(65535, int(batt_v * 1000)))
     temp_raw = 0xFF if temp_c is None else max(0, min(254, int(temp_c) + 40))
-    t        = max(0, min(0xFFFFFFFF, int(mission_time_s)))
+    t = max(0, min(0xFFFFFFFF, int(mission_time_s)))
 
     cs = CALLSIGN[:6].ljust(6).encode("ascii")  # always exactly 6 bytes
 
@@ -274,7 +290,7 @@ def build_beacon_packet(state_code, batt_v, temp_c, mission_time_s):
     payload.append(temp_raw)
     payload.append((t >> 24) & 0xFF)
     payload.append((t >> 16) & 0xFF)
-    payload.append((t >>  8) & 0xFF)
+    payload.append((t >> 8) & 0xFF)
     payload.append(t & 0xFF)
     payload.append(_crc8(payload))
 
@@ -286,11 +302,11 @@ class _RingQueue:
     """Fixed-size FIFO ring buffer. Avoids collections.deque (unreliable in CircuitPython)."""
 
     def __init__(self, maxsize):
-        self._buf   = [None] * maxsize
-        self._head  = 0
-        self._tail  = 0
+        self._buf = [None] * maxsize
+        self._head = 0
+        self._tail = 0
         self._count = 0
-        self._max   = maxsize
+        self._max = maxsize
 
     def push(self, item):
         if self._count >= self._max:
@@ -325,21 +341,24 @@ class CommsConfig:
     telem_cadence:   FSM should push telemetry every N TX windows
                      (signaled via on_tx_window callback; not enforced internally)
     """
-    DEFAULT_RX_TICKS        = 50
+
+    DEFAULT_RX_TICKS = 50
     DEFAULT_TX_PACKET_COUNT = 10
-    DEFAULT_TELEM_CADENCE   = 3
+    DEFAULT_TELEM_CADENCE = 3
 
     def __init__(self):
         rx, tx, cad = _nvm_read_config()
         # 0 or 0xFF means the byte was never written (fresh NVM may read as either)
-        self.rx_ticks        = rx  if rx  not in (0, 0xFF) else self.DEFAULT_RX_TICKS
-        self.tx_packet_count = tx  if tx  not in (0, 0xFF) else self.DEFAULT_TX_PACKET_COUNT
-        self.telem_cadence   = cad if cad not in (0, 0xFF) else self.DEFAULT_TELEM_CADENCE
+        self.rx_ticks = rx if rx not in (0, 0xFF) else self.DEFAULT_RX_TICKS
+        self.tx_packet_count = (
+            tx if tx not in (0, 0xFF) else self.DEFAULT_TX_PACKET_COUNT
+        )
+        self.telem_cadence = cad if cad not in (0, 0xFF) else self.DEFAULT_TELEM_CADENCE
 
     def apply(self, rx_ticks, tx_packet_count, telem_cadence):
-        self.rx_ticks        = max(1, rx_ticks        & 0xFF)
+        self.rx_ticks = max(1, rx_ticks & 0xFF)
         self.tx_packet_count = max(1, tx_packet_count & 0xFF)
-        self.telem_cadence   = max(1, telem_cadence   & 0xFF)
+        self.telem_cadence = max(1, telem_cadence & 0xFF)
         _nvm_write_config(self.rx_ticks, self.tx_packet_count, self.telem_cadence)
 
 
@@ -370,25 +389,27 @@ class CommsManager:
     _TX = 1
 
     def __init__(self, radio, default_modulation=FSK):
-        self._radio      = radio
+        self._radio = radio
         self._default_modulation = default_modulation
         self._dual_radio = None
         self._lora_deadline = None
         self._state_code = _nvm_read_state()
-        self.config      = CommsConfig()
-        self._mode       = self._RX
+        self.config = CommsConfig()
+        self._mode = self._RX
 
         self._rx_elapsed = 0
-        self._tx_sent    = 0
-        self._tx_windows = 0   # increments each time a TX window ends
-        self.radio_errors = 0  # consecutive radio exceptions (RX or TX); 0 after any clean call
+        self._tx_sent = 0
+        self._tx_windows = 0  # increments each time a TX window ends
+        self.radio_errors = (
+            0  # consecutive radio exceptions (RX or TX); 0 after any clean call
+        )
 
-        self._telem_q   = _RingQueue(maxsize=16)
+        self._telem_q = _RingQueue(maxsize=16)
         self._amateur_q = _RingQueue(maxsize=32)
 
-        self.on_state_command = None   # fn(new_state_code: int, lock: bool)
-        self.on_tx_window     = None   # fn(window_num: int, cadence: int)
-        self.on_amateur_rx    = None   # fn(payload: bytes)
+        self.on_state_command = None  # fn(new_state_code: int, lock: bool)
+        self.on_tx_window = None  # fn(window_num: int, cadence: int)
+        self.on_amateur_rx = None  # fn(payload: bytes)
         self.set_modulation(default_modulation)
 
     # ── Public API ──────────────────────────────────────────────────────────────
@@ -412,8 +433,9 @@ class CommsManager:
         if self._dual_radio is None:
             self._dual_radio = DualModeRadio(self._radio)
         self._dual_radio.set_modulation(modulation)
-        self._lora_deadline = (time.monotonic() + duration_s
-                               if modulation == LORA else None)
+        self._lora_deadline = (
+            time.monotonic() + duration_s if modulation == LORA else None
+        )
         self._mode = self._RX
         self._rx_elapsed = 0
 
@@ -444,7 +466,9 @@ class CommsManager:
     @state_code.setter
     def state_code(self, code):
         code = code & 0x7F
-        if code != self._state_code:   # a spammed command must not rewrite NVM every time
+        if (
+            code != self._state_code
+        ):  # a spammed command must not rewrite NVM every time
             _nvm_write_state(code)
         self._state_code = code
 
@@ -472,7 +496,7 @@ class CommsManager:
         if self._lora_deadline is not None and time.monotonic() >= self._lora_deadline:
             self.set_modulation(FSK)
         if self._state_code == 0:
-            self._rx_tick()   # stay alive so ground can send a non-zero state command
+            self._rx_tick()  # stay alive so ground can send a non-zero state command
             return
 
         if self._mode == self._RX:
@@ -488,7 +512,7 @@ class CommsManager:
                 if self._tx_sent >= self.config.tx_packet_count:
                     self._enter_rx()
             else:
-                self._enter_rx()   # queues drained early — return to RX
+                self._enter_rx()  # queues drained early — return to RX
 
     # ── Internal ────────────────────────────────────────────────────────────────
 
@@ -515,15 +539,15 @@ class CommsManager:
         if raw is None or len(raw) < 2:
             return False
 
-        header  = raw[0]
+        header = raw[0]
         payload = bytes(raw[1:])
 
         if header == HDR_COMMAND:
             self._handle_command(payload)
-            return True   # schedule paused this tick
+            return True  # schedule paused this tick
 
         if header == HDR_AMATEUR:
-            self._amateur_q.push(payload)   # O(1) push, no processing
+            self._amateur_q.push(payload)  # O(1) push, no processing
             if self.on_amateur_rx is not None:
                 self.on_amateur_rx(payload)
 
@@ -575,7 +599,9 @@ class CommsManager:
             # treats a command for the current state as a no-op. (A dedup against the stored
             # code would also swallow a command that matches it even though the FSM has since
             # moved on, and the first command heard after boot.)
-            self.state_code = new_code   # writes to all 3 NVM copies + checksum, only on change
+            self.state_code = (
+                new_code  # writes to all 3 NVM copies + checksum, only on change
+            )
             print("[COMMS] State ->", new_code, "lock" if lock else "unlock")
             if self.on_state_command is not None:
                 self.on_state_command(new_code, lock)
@@ -585,8 +611,14 @@ class CommsManager:
                 print("[COMMS] Config command too short")
                 return
             self.config.apply(plaintext[1], plaintext[2], plaintext[3])
-            print("[COMMS] Config: rx=%d tx=%d cad=%d" % (
-                self.config.rx_ticks, self.config.tx_packet_count, self.config.telem_cadence))
+            print(
+                "[COMMS] Config: rx=%d tx=%d cad=%d"
+                % (
+                    self.config.rx_ticks,
+                    self.config.tx_packet_count,
+                    self.config.telem_cadence,
+                )
+            )
 
         elif cmd == CMD_SET_MODULATION:
             if len(plaintext) != 5:
@@ -634,17 +666,17 @@ def configure_radio():
     time.sleep(0.01)
     r.long_range_mode = True
     r.idle()
-    r.frequency_mhz   = FREQ_MHZ
+    r.frequency_mhz = FREQ_MHZ
     r.signal_bandwidth = SIGNAL_BW
     r.spreading_factor = SPREADING_FACTOR
-    r.coding_rate      = CODING_RATE
-    r.preamble_length  = PREAMBLE_LEN
-    r.enable_crc       = ENABLE_CRC
-    r.tx_power         = TX_POWER_DBM
-    r._write_u8(_REG_SYNC_WORD, SYNC_WORD)   # required for TinyGS to receive packets
+    r.coding_rate = CODING_RATE
+    r.preamble_length = PREAMBLE_LEN
+    r.enable_crc = ENABLE_CRC
+    r.tx_power = TX_POWER_DBM
+    r._write_u8(_REG_SYNC_WORD, SYNC_WORD)  # required for TinyGS to receive packets
     # `node` is a RadioHead address filter, not the sync word. Broadcast = accept
     # every packet; Comms does its own filtering by header byte.
-    r.node             = _BROADCAST
+    r.node = _BROADCAST
     return r
 
 
@@ -663,8 +695,13 @@ def send_raw(radio, packet):
     packet = bytes(packet)
     if len(packet) < 5:
         packet = packet + bytes(5 - len(packet))
-    return radio.send(packet[4:], destination=packet[0], node=packet[1],
-                      identifier=packet[2], flags=packet[3])
+    return radio.send(
+        packet[4:],
+        destination=packet[0],
+        node=packet[1],
+        identifier=packet[2],
+        flags=packet[3],
+    )
 
 
 def print_status(r):
@@ -681,7 +718,7 @@ def print_status(r):
 # Change MODE to run hardware tests directly from this file.
 # When imported by the FSM, this block does not execute.
 if __name__ == "__main__":
-    MODE = "probe"   # "probe", "listen", or "beacon"
+    MODE = "probe"  # "probe", "listen", or "beacon"
 
     try:
         radio = configure_radio()

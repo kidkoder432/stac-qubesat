@@ -23,7 +23,9 @@ clock = [0.0]
 time.monotonic = lambda: clock[0]
 
 
-class StopRun(BaseException):  # BaseException so run()'s `except Exception` doesn't eat it
+class StopRun(
+    BaseException
+):  # BaseException so run()'s `except Exception` doesn't eat it
     pass
 
 
@@ -34,7 +36,10 @@ class CubeSat:
     battery_voltage = 8.2  # V
     temperature = 25.0  # degC (IMU)
     solar_charging = True
-    def charge_current(self):  # a plain method on the real board (no @property), so a test must call it
+
+    def charge_current(
+        self,
+    ):  # a plain method on the real board (no @property), so a test must call it
         return 120.0  # mA
 
     c_state_err = 0
@@ -168,7 +173,8 @@ class Radio:
 
     def send(self, b, destination=None, node=None, identifier=None, flags=None, **kw):
         """pycubed_rfm9x.send(): the RadioHead header goes in front. send_raw() feeds the first
-        4 bytes of our packet in as that header, so tx holds exactly the bytes on air."""
+        4 bytes of our packet in as that header, so tx holds exactly the bytes on air.
+        """
         if self.fail:
             raise RuntimeError("spi hang")
         header = bytes([destination or 0, node or 0, identifier or 0, flags or 0])
@@ -391,7 +397,9 @@ def test_deploy_command_spam_burns_once():
     for _ in range(4):
         cmd(radio, StateID.DEPLOY, lock=True)
     step(f, cm, 1, 10)
-    assert len(burns) == 2, "one cycle (both wires); repeats of DEPLOY must not re-arm the burn"
+    assert (
+        len(burns) == 2
+    ), "one cycle (both wires); repeats of DEPLOY must not re-arm the burn"
 
 
 def test_safety_overrides_lock_and_clears_it():
@@ -527,7 +535,9 @@ def test_mission_time_survives_reboot():
     clock[0] = 0.0
     f2 = _reboot()
     assert 0 < f2.mission_time <= elapsed
-    assert elapsed - f2.mission_time <= Q.QubeSatFSM.MISSION_CLOCK_SAVE_S + 30, "lose at most one save period"
+    assert (
+        elapsed - f2.mission_time <= Q.QubeSatFSM.MISSION_CLOCK_SAVE_S + 30
+    ), "lose at most one save period"
 
 
 def test_mission_time_ring_wraps_and_skips_a_torn_write():
@@ -619,7 +629,9 @@ def test_after_low_battery_returns_to_the_scheduled_state():
 
 def _science_files():
     return sorted(
-        os.path.join(CubeSat.sd_dir, n) for n in os.listdir(CubeSat.sd_dir) if n.startswith("mission")
+        os.path.join(CubeSat.sd_dir, n)
+        for n in os.listdir(CubeSat.sd_dir)
+        if n.startswith("mission")
     )
 
 
@@ -640,7 +652,9 @@ def test_science_sweeps_all_points_and_counts_completed_sweeps():
     assert f.sweeps_completed == 2
     rows = _read_rows()
     first = [r for r in rows if r[1] == "0"]
-    assert [int(r[2]) for r in first] == list(range(2800, 2951)), "every frequency once, in order"
+    assert [int(r[2]) for r in first] == list(
+        range(2800, 2951)
+    ), "every frequency once, in order"
     assert all(r[3] != "ERR" and r[4] != "ERR" for r in first)
 
 
@@ -788,7 +802,9 @@ def _add_failing_task(f, fail_times):
 def test_task_exception_is_isolated_and_counted():
     f, cm, radio = make()
     _add_failing_task(f, 3)
-    step(f, cm, 1, 10)  # 3 failures, then it works: no fault, everything else kept running
+    step(
+        f, cm, 1, 10
+    )  # 3 failures, then it works: no fault, everything else kept running
     assert f.task_error_total == 3 and f.task_errors["Boom"] == 0
     assert f.fault_count == 0 and f.state == StateID.IDLE
     assert f.telemetry_packet()[-1] == 3
@@ -895,7 +911,9 @@ def test_beacon_sends_unknown_for_a_missing_sensor_not_zero():
     f._task_beacon()
     pkt = cm._telem_q.pop()
     assert pkt[9] == 0xFF, "temperature unknown"
-    assert pkt[7:9] == b"\x1f\xf8" or pkt[7] * 256 + pkt[8] == 8200, "battery still reported"
+    assert (
+        pkt[7:9] == b"\x1f\xf8" or pkt[7] * 256 + pkt[8] == 8200
+    ), "battery still reported"
     cubesat.temperature = 25.0
 
 
@@ -903,7 +921,9 @@ def test_ground_command_equal_to_the_stored_state_still_reaches_the_fsm():
     """The first command after boot often equals the stored code; a dedup in Comms would drop it."""
     f, cm, radio = make()
     assert cm.state_code == StateID.IDLE
-    step(f, cm, 10, 380)  # deployed; Comms still holds the code IDLE (the last ground command)
+    step(
+        f, cm, 10, 380
+    )  # deployed; Comms still holds the code IDLE (the last ground command)
     assert f.deployed and f.last_ground_contact is None
     cmd(radio, StateID.IDLE)
     step(f, cm, 1, 2)
@@ -927,9 +947,15 @@ def test_sd_nearly_full_deletes_oldest_file_only():
     finally:
         Q._sd_free_bytes = real
     left = _science_files()
-    assert os.path.basename(older[0]) not in [os.path.basename(p) for p in left], "oldest deleted"
-    assert os.path.basename(older[1]) in [os.path.basename(p) for p in left], "stopped once there was room"
-    assert os.path.basename(f.log_file) in [os.path.basename(p) for p in left], "current file never deleted"
+    assert os.path.basename(older[0]) not in [
+        os.path.basename(p) for p in left
+    ], "oldest deleted"
+    assert os.path.basename(older[1]) in [
+        os.path.basename(p) for p in left
+    ], "stopped once there was room"
+    assert os.path.basename(f.log_file) in [
+        os.path.basename(p) for p in left
+    ], "current file never deleted"
     assert len(_read_rows()) == 1, "the sample was still recorded"
 
 
@@ -945,15 +971,16 @@ def test_sd_with_room_deletes_nothing():
 
 
 def test_all_modules_share_one_hardware_object():
-    import hardware
+    import pycubed
 
-    assert Q.cubesat is C.cubesat is hardware.cubesat
+    assert Q.cubesat is C.cubesat is pycubed.cubesat
 
 
 def test_burnwire_uses_the_shared_hardware_import():
     src = open("BurnWire.py").read()
     compile(src, "BurnWire.py", "exec")
-    assert "from hardware import cubesat" in src and "lib.pycubed" not in src.replace("# ", "")
+    assert "import pycubed" in src and "pycubed.cubesat" in src
+    assert "lib.pycubed" not in src
 
 
 def test_bench_main_runs_the_fsm_without_energising_the_burn_wire():
@@ -962,13 +989,19 @@ def test_bench_main_runs_the_fsm_without_energising_the_burn_wire():
     cubesat.radio1 = Radio()
     real = Q.BurnWire
     cls = Q.QubeSatFSM
-    saved = (cls.DEPLOY_AFTER_IDLE_S, cls.SLOT_S, cls.SCIENCE_ONLY_S)  # build() changes class constants
+    saved = (
+        cls.DEPLOY_AFTER_IDLE_S,
+        cls.SLOT_S,
+        cls.SCIENCE_ONLY_S,
+    )  # build() changes class constants
     try:
         reset_world()
         bench_main.DEPLOY_AFTER_S = 60
         with contextlib.redirect_stdout(io.StringIO()):
             fsm, comms = bench_main.build()
-        assert comms.state_code == C.STATE_IDLE, "fresh NVM reads as STOP; bench forces the radio on"
+        assert (
+            comms.state_code == C.STATE_IDLE
+        ), "fresh NVM reads as STOP; bench forces the radio on"
         step(fsm, comms, 10, 12)
         assert fsm.deployed, "DEPLOY_AFTER_S applied"
         assert not burns, "the real burn wire must not be driven on the bench"
@@ -1003,7 +1036,9 @@ def test_real_run_loop():
         time.sleep = real_sleep
     assert f.deployed, "run() should have reached DEPLOY and burned"
     assert f.uptime > 3600
-    assert 0 < f.mission_time < f.uptime, "mission time counts from the burn, not from boot"
+    assert (
+        0 < f.mission_time < f.uptime
+    ), "mission time counts from the burn, not from boot"
     assert f.state in (StateID.SCIENCE, StateID.COMMS)
 
 

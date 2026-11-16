@@ -8,7 +8,7 @@ from StateCodeGenerator import StateCodec, StateID
 from Task import Task
 
 # One import path for the hardware object, shared with Comms and BurnWire (see hardware.py).
-from hardware import cubesat
+from pycubed import cubesat
 from Comms import build_beacon_packet
 
 import struct
@@ -140,7 +140,10 @@ def _save_clock(seconds, last_slot):
 def _load_lock():
     """The state the ground locked, or None."""
     try:
-        if _nvm[_NVM_LOCK] == _LOCK_MAGIC and _nvm[_NVM_LOCK + 2] == _nvm[_NVM_LOCK + 1] ^ 0xC3:
+        if (
+            _nvm[_NVM_LOCK] == _LOCK_MAGIC
+            and _nvm[_NVM_LOCK + 2] == _nvm[_NVM_LOCK + 1] ^ 0xC3
+        ):
             return _nvm[_NVM_LOCK + 1]
     except Exception:
         pass
@@ -174,7 +177,9 @@ class TemperatureCheck:
     def is_safe(self):
         temp = _temperature_c()
         if temp is None:
-            return True  # no reading (IMU missing); don't force IDLE on a missing sensor
+            return (
+                True  # no reading (IMU missing); don't force IDLE on a missing sensor
+            )
         return temp < self.MAX_C
 
 
@@ -192,7 +197,9 @@ class QubeSatFSM:
     # didn't, the ground probably can't reach us, so recovery has to be autonomous.
     # "Ground contact" = a valid command received after the burn ran.
     BURN_RETRY_BACKOFF_S = 60 * 60  # burn raised an error: retry this often (any state)
-    BURN_REBURN_AFTER_S = 12 * 60 * 60  # burn "worked" but we never heard from ground: re-burn
+    BURN_REBURN_AFTER_S = (
+        12 * 60 * 60
+    )  # burn "worked" but we never heard from ground: re-burn
     BURN_MAX_TOTAL = 20  # cap on wire burns that actually ran, per boot (10 per wire); errors don't count
     # Both wires are needed: each releases one half of the dipole antenna (Q-D3).
     BURN_WIRES = ("1", "2")
@@ -200,7 +207,9 @@ class QubeSatFSM:
     # (it treats the first as a percent and ignores the second, see docs/FSM_SPEC.md section 6).
     BURN_DUTY = 0.25
     BURN_DURATION_S = 30
-    MISSION_CLOCK_SAVE_S = 15 * 60  # save mission time to NVM this often (lost on reboot: up to this much)
+    MISSION_CLOCK_SAVE_S = (
+        15 * 60
+    )  # save mission time to NVM this often (lost on reboot: up to this much)
 
     # Watcher (TODO B5). Tasks and comms run inside a guard: an exception is logged and counted,
     # not fatal. A component that fails TASK_FAULT_LIMIT times in a row is a fault, and a fault
@@ -256,18 +265,26 @@ class QubeSatFSM:
         self.uptime = 0.0
         self._start_time = time.monotonic()
         self._clock_base = 0  # mission seconds already counted before this boot
-        self._clock_started_at = None  # uptime when mission time started counting; None = not started
+        self._clock_started_at = (
+            None  # uptime when mission time started counting; None = not started
+        )
         self._clock_slot = -1
         self._clock_saved_at = 0.0
         self.log_file = None
-        self.deployed = _load_deployed()  # True once both burn wires have fired (persists)
+        self.deployed = (
+            _load_deployed()
+        )  # True once both burn wires have fired (persists)
         if self.deployed:
             self._clock_base, self._clock_slot = _load_clock()
             self._clock_started_at = 0.0
-        self.burn_done = {w: False for w in self.BURN_WIRES}  # wires fired in the current burn cycle
+        self.burn_done = {
+            w: False for w in self.BURN_WIRES
+        }  # wires fired in the current burn cycle
         self.crash_streak = _load_streak()  # fast crashes in a row, from NVM
         self.task_errors = {}  # consecutive exceptions per task name
-        self.task_error_total = 0  # all caught task exceptions since boot (saturates at 255)
+        self.task_error_total = (
+            0  # all caught task exceptions since boot (saturates at 255)
+        )
         self.fault_count = 0
         self.radio_reconfigs = 0
         self.burn_attempts = 0
@@ -276,7 +293,9 @@ class QubeSatFSM:
         # uptime of the first command heard after deploy; remembered across reboots so a
         # working antenna is not burned again after every reset
         self.last_ground_contact = 0.0 if (self.deployed and _load_contact()) else None
-        self.locked = False  # True = ground has locked the state; transition checks do nothing
+        self.locked = (
+            False  # True = ground has locked the state; transition checks do nothing
+        )
         self.power = PowerLevel()
         self.temperature = (
             TemperatureCheck()
@@ -319,10 +338,18 @@ class QubeSatFSM:
         # Payload Subsystem
         self.payload = PayloadUART(cubesat)
         self.current_sweep_freq = self.SWEEP_START_MHZ
-        self.sweep_id = 0  # the sweep in progress (0-based); also = sweeps completed so far
-        self.sweeps_completed = 0  # full sweeps (a full sweep is what the W plot needs, Q-H2)
-        self.payload_errors = 0  # consecutive science points where the payload gave nothing
-        self.latest_data = None  # (sweep_id, freq_mhz, contrast, photodiode) waiting to be recorded
+        self.sweep_id = (
+            0  # the sweep in progress (0-based); also = sweeps completed so far
+        )
+        self.sweeps_completed = (
+            0  # full sweeps (a full sweep is what the W plot needs, Q-H2)
+        )
+        self.payload_errors = (
+            0  # consecutive science points where the payload gave nothing
+        )
+        self.latest_data = (
+            None  # (sweep_id, freq_mhz, contrast, photodiode) waiting to be recorded
+        )
 
         self.comms = None
 
@@ -565,14 +592,16 @@ class QubeSatFSM:
             # unknown code, or STOP (STOP is a Comms command, not an FSM state)
             print(f"[FSM] No task list for state {new_state}, ignoring transition.")
             return
-        print(f"[FSM] Transition: {StateID.name(self.state)} -> {StateID.name(new_state)}")
+        print(
+            f"[FSM] Transition: {StateID.name(self.state)} -> {StateID.name(new_state)}"
+        )
         self.state = new_state
         self.current_code = StateCodec.encode(
             new_state
         )  # adding this so that when state changes -> so does current code
         self.tasks = self._build_tasks_for_state(new_state)
 
-    # Check for critical battery voltages - not to be used for science. 
+    # Check for critical battery voltages - not to be used for science.
     def _task_battery_check(self):
         try:
             vbatt = cubesat.battery_voltage
@@ -709,7 +738,9 @@ class QubeSatFSM:
             # board API: solar_charging is a property (bool, LTC4121 CHRG pin) but charge_current
             # is a plain METHOD in lib/pycubed.py (no @property), so it has to be called.
             charging = cubesat.solar_charging
-            print(f"[COMMS] Solar charging: {charging}, {cubesat.charge_current():.1f} mA")
+            print(
+                f"[COMMS] Solar charging: {charging}, {cubesat.charge_current():.1f} mA"
+            )
             if charging:
                 self.solar_panels_on = True
                 self.equipment_check["solar_panel"] = True
@@ -735,7 +766,9 @@ class QubeSatFSM:
                     continue
                 burn.cubesatBurn(wire, self.BURN_DUTY, self.BURN_DURATION_S)
                 self.burn_done[wire] = True
-                self.burn_total += 1  # only burns that actually ran count toward the cap
+                self.burn_total += (
+                    1  # only burns that actually ran count toward the cap
+                )
             self.equipment_check["burn_wire"] = True
             self.deployed = True
             _save_deployed()
@@ -755,7 +788,10 @@ class QubeSatFSM:
           - a burn ran but no ground command has been heard since -> re-burn every BURN_REBURN_AFTER_S
         Stops once the ground is heard, or after BURN_MAX_TOTAL burns this boot.
         """
-        if self.last_ground_contact is not None or self.burn_total >= self.BURN_MAX_TOTAL:
+        if (
+            self.last_ground_contact is not None
+            or self.burn_total >= self.BURN_MAX_TOTAL
+        ):
             return  # ground heard (antenna works) or burned enough already
         if self.deployed:
             # after a reboot there's no last burn time; count from boot
@@ -773,7 +809,9 @@ class QubeSatFSM:
                 return  # don't burn on a weak battery; try again next check
         except Exception:
             return
-        print(f"[WATCHDOG] No antenna confirmation; re-firing burn wires (wire burns so far: {self.burn_total}).")
+        print(
+            f"[WATCHDOG] No antenna confirmation; re-firing burn wires (wire burns so far: {self.burn_total})."
+        )
         if self.deployed:
             # re-burn both: either half may be stuck. (Before deployment, retry only what failed.)
             self.burn_done = {w: False for w in self.BURN_WIRES}
@@ -785,7 +823,9 @@ class QubeSatFSM:
     def _task_init_sd_card(self):
         try:
             log_file = cubesat.new_file("/data/mission", binary=False)
-            if log_file is None:  # new_file returns None if there's no SD card / can't make the dir
+            if (
+                log_file is None
+            ):  # new_file returns None if there's no SD card / can't make the dir
                 raise RuntimeError("new_file returned None (no SD card?)")
             with open(log_file, "a") as f:
                 f.write(self.SCIENCE_FILE_HEADER + "\n")
@@ -804,7 +844,11 @@ class QubeSatFSM:
         if free is None or free >= self.SD_MIN_FREE_BYTES:
             return
         try:
-            old = sorted(n for n in os.listdir(directory) if n.startswith("mission") and n != current)
+            old = sorted(
+                n
+                for n in os.listdir(directory)
+                if n.startswith("mission") and n != current
+            )
         except Exception as e:
             print("[SD] Could not list", directory, e)
             return
@@ -897,7 +941,9 @@ class QubeSatFSM:
             # otherwise: still waiting on burn wire / SD card, stay in DEPLOY
 
         elif self.state in (StateID.SCIENCE, StateID.COMMS):
-            self.transition(self._scheduled_state())  # no-op when already in the right state
+            self.transition(
+                self._scheduled_state()
+            )  # no-op when already in the right state
 
     def _check_equipment_functional(self):
         """Deploy-time check. Payload and solar panels are checked by their own states."""
@@ -910,7 +956,9 @@ class QubeSatFSM:
         t = self.mission_time
         if t < self.SCIENCE_ONLY_S:
             return StateID.SCIENCE
-        slot = int((t - self.SCIENCE_ONLY_S) // self.SLOT_S) % (self.COMMS_SLOTS + self.SCIENCE_SLOTS)
+        slot = int((t - self.SCIENCE_ONLY_S) // self.SLOT_S) % (
+            self.COMMS_SLOTS + self.SCIENCE_SLOTS
+        )
         return StateID.COMMS if slot < self.COMMS_SLOTS else StateID.SCIENCE
 
     def _send_handshake(self):
@@ -942,7 +990,7 @@ class QubeSatFSM:
         """
         freq = self.current_sweep_freq
         try:
-            pd = self.payload.read_photodiode() 
+            pd = self.payload.read_photodiode()
             contrast = self.payload.measure_contrast(freq, timeout=30.0)
         except Exception as e:
             print("[SCIENCE] Payload error:", e)
@@ -973,20 +1021,22 @@ class QubeSatFSM:
             n = self.task_errors.get(name, 0) + 1
             self.task_errors[name] = n
             self.task_error_total = min(self.task_error_total + 1, 255)
-            print(f"[WATCHER] {name} raised {e!r} ({n} in a row)")
+            print(f"[WATCHER] {name} raised {repr(e)} ({n} in a row)")
             try:
                 cubesat.log(f"{name},{e}")
             except Exception:
                 pass
             if n >= self.TASK_FAULT_LIMIT:
-                self._fault(f"{name} failed {n} times in a row: {e!r}")
+                self._fault(f"{name} failed {n} times in a row: {repr(e)}")
 
     def _fault(self, reason):
         """A component is not recovering. Reset the board, unless it has been crash-looping."""
         self.fault_count += 1
         self.task_errors.clear()
         if self.crash_streak >= self.RESET_STREAK_MAX:
-            print(f"[WATCHER] Fault ({reason}) but {self.crash_streak} fast crashes in a row; staying up degraded.")
+            print(
+                f"[WATCHER] Fault ({reason}) but {self.crash_streak} fast crashes in a row; staying up degraded."
+            )
             return
         raise FatalFault(reason)
 

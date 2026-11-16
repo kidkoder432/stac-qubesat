@@ -6,11 +6,12 @@ the radio error counter and the 437.42 MHz carrier.
 
 Run from this directory:   python3 test_comms.py
 """
+
 import sys
 import types
 import unittest
 
-sys.path.insert(0, '.')
+sys.path.insert(0, ".")
 
 
 class FakeRadio:
@@ -24,8 +25,8 @@ class FakeRadio:
         self.destination = 0xFF
         self.identifier = 0
         self.flags = 0
-        self.air = []     # every packet sent, exactly as it would appear on air
-        self.inbox = []   # on-air packets waiting to be received
+        self.air = []  # every packet sent, exactly as it would appear on air
+        self.inbox = []  # on-air packets waiting to be received
         self.regs = {}
 
     def _write_u8(self, address, val):
@@ -37,20 +38,38 @@ class FakeRadio:
     def idle(self):
         pass
 
-    def send(self, data, *, keep_listening=False, destination=None, node=None,
-             identifier=None, flags=None):
+    def send(
+        self,
+        data,
+        *,
+        keep_listening=False,
+        destination=None,
+        node=None,
+        identifier=None,
+        flags=None
+    ):
         assert 0 < len(data) <= 252
-        header = bytes([
-            self.destination if destination is None else destination,
-            self.node if node is None else node,
-            self.identifier if identifier is None else identifier,
-            self.flags if flags is None else flags,
-        ])
+        header = bytes(
+            [
+                self.destination if destination is None else destination,
+                self.node if node is None else node,
+                self.identifier if identifier is None else identifier,
+                self.flags if flags is None else flags,
+            ]
+        )
         self.air.append(header + bytes(data))
         return True
 
-    def receive(self, *, keep_listening=True, with_header=False, with_ack=False,
-                timeout=None, debug=False, view=False):
+    def receive(
+        self,
+        *,
+        keep_listening=True,
+        with_header=False,
+        with_ack=False,
+        timeout=None,
+        debug=False,
+        view=False
+    ):
         if not self.inbox:
             return None
         packet = self.inbox.pop(0)
@@ -61,11 +80,13 @@ class FakeRadio:
         return bytes(packet if with_header else packet[4:])
 
 
-# Comms.py imports the board object from hardware.py, which falls back to `pycubed` on a desktop;
+# Comms.py imports the board object from pycubed.py, which falls back to `pycubed` on a desktop;
 # give it a fake board.
-_fake_pycubed = types.ModuleType('pycubed')
-_fake_pycubed.cubesat = types.SimpleNamespace(hardware={"Radio1": True}, radio1=FakeRadio())
-sys.modules['pycubed'] = _fake_pycubed
+_fake_pycubed = types.ModuleType("pycubed")
+_fake_pycubed.cubesat = types.SimpleNamespace(
+    hardware={"Radio1": True}, radio1=FakeRadio()
+)
+sys.modules["pycubed"] = _fake_pycubed
 
 import Comms
 import tinygs_decoder
@@ -84,7 +105,9 @@ class TestNewCodeComms(unittest.TestCase):
         self.assertEqual(self.radio.node, 0xFF)
 
     def test_beacon_on_air_is_16_bytes_and_decodes(self):
-        self.comms.push_telemetry(Comms.build_beacon_packet(Comms.STATE_SCIENCE, 7.4, 25.3, 99))
+        self.comms.push_telemetry(
+            Comms.build_beacon_packet(Comms.STATE_SCIENCE, 7.4, 25.3, 99)
+        )
         self.comms._tx_tick()
         on_air = self.radio.air[-1]
         self.assertEqual(len(on_air), 16)
@@ -124,14 +147,24 @@ class TestNewCodeComms(unittest.TestCase):
             config = Comms.CommsConfig()
             self.assertEqual(
                 (config.rx_ticks, config.tx_packet_count, config.telem_cadence),
-                (Comms.CommsConfig.DEFAULT_RX_TICKS,
-                 Comms.CommsConfig.DEFAULT_TX_PACKET_COUNT,
-                 Comms.CommsConfig.DEFAULT_TELEM_CADENCE))
+                (
+                    Comms.CommsConfig.DEFAULT_RX_TICKS,
+                    Comms.CommsConfig.DEFAULT_TX_PACKET_COUNT,
+                    Comms.CommsConfig.DEFAULT_TELEM_CADENCE,
+                ),
+            )
 
     def test_nvm_does_not_overlap_pycubed(self):
         pycubed_bytes = {0, 6, 7, 9, 10, 11, 16}
-        ours = {Comms._NVM_S1, Comms._NVM_S2, Comms._NVM_S3, Comms._NVM_CS,
-                Comms._NVM_CFG_RX, Comms._NVM_CFG_TX, Comms._NVM_CFG_CAD}
+        ours = {
+            Comms._NVM_S1,
+            Comms._NVM_S2,
+            Comms._NVM_S3,
+            Comms._NVM_CS,
+            Comms._NVM_CFG_RX,
+            Comms._NVM_CFG_TX,
+            Comms._NVM_CFG_CAD,
+        }
         self.assertFalse(ours & pycubed_bytes)
 
 
@@ -158,7 +191,9 @@ class TestMergedChanges(unittest.TestCase):
 
     def test_lock_bit_is_bit_7_of_the_state_byte_and_defaults_to_off(self):
         plain = Comms._decrypt(Comms.build_state_command(Comms.STATE_SCIENCE)[1:])
-        locked = Comms._decrypt(Comms.build_state_command(Comms.STATE_SCIENCE, lock=True)[1:])
+        locked = Comms._decrypt(
+            Comms.build_state_command(Comms.STATE_SCIENCE, lock=True)[1:]
+        )
         self.assertEqual(plain[1], Comms.STATE_SCIENCE)
         self.assertEqual(locked[1], Comms.STATE_SCIENCE | 0x80)
         self.assertEqual((locked[1] ^ locked[-2]), 0xFF)  # complement check still holds
@@ -192,12 +227,16 @@ class TestMergedChanges(unittest.TestCase):
         self.assertEqual(self.got, [(Comms.STATE_STOP, False)])
         self.assertEqual(self.comms.state_code, Comms.STATE_STOP)
         body = bytes([Comms.CMD_SET_STATE, 99, (~99) & 0xFF])
-        self.send_command(bytes([Comms.HDR_COMMAND]) + Comms._encrypt(body + bytes([Comms._crc8(body)])))
+        self.send_command(
+            bytes([Comms.HDR_COMMAND])
+            + Comms._encrypt(body + bytes([Comms._crc8(body)]))
+        )
         self.assertEqual(len(self.got), 1)
 
     def test_radio_errors_count_in_a_row_and_clear_after_a_good_call(self):
         def boom(**kw):
             raise RuntimeError("spi")
+
         good = self.radio.receive
         self.radio.receive = boom
         for _ in range(3):
@@ -213,5 +252,5 @@ class TestMergedChanges(unittest.TestCase):
         self.assertEqual(self.comms.radio_errors, 1)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

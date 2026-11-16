@@ -13,7 +13,9 @@ Edit the switches below; nothing else needs to change.
 
 import Comms
 import QubeSatFSM as fsm_module
-from hardware import cubesat  # noqa: F401  (same hardware object everywhere, see hardware.py)
+from pycubed import (
+    cubesat,
+)  # noqa: F401  (same hardware object everywhere, see hardware.py)
 
 # ---- bench switches -----------------------------------------------------------------------
 # False = the burn wire is only printed, nothing is energised. Leave False until Q-D1 is answered.
@@ -34,7 +36,9 @@ class _DryBurn:
     """Stands in for BurnWire on the bench: same calls, nothing is driven."""
 
     def cubesatBurn(self, burn_num, dutycycle, duration):
-        print(f"[BENCH] would burn wire {burn_num}: duty={dutycycle}, duration={duration}")
+        print(
+            f"[BENCH] would burn wire {burn_num}: duty={dutycycle}, duration={duration}"
+        )
 
     def burningCheck(self):
         return "dry run (burn wire disabled)"
@@ -56,7 +60,9 @@ def build():
     radio = Comms.configure_radio()
     comms = Comms.CommsManager(radio)
     if FORCE_RADIO_ON and comms.state_code == Comms.STATE_STOP:
-        print("[BENCH] NVM says STOP; forcing IDLE so the radio transmits (FORCE_RADIO_ON)")
+        print(
+            "[BENCH] NVM says STOP; forcing IDLE so the radio transmits (FORCE_RADIO_ON)"
+        )
         comms.state_code = Comms.STATE_IDLE
     fsm.attach_comms(comms)
     return fsm, comms

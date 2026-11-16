@@ -46,7 +46,7 @@ class PayloadUART:
     def __init__(self, satellite=None):
         if satellite is None:
             try:
-                from hardware import cubesat
+                from pycubed import cubesat
 
                 satellite = cubesat
             except Exception:
