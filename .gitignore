@@ -3,5 +3,6 @@ stubs
 .vscode
 adafruit
 .venv
-lib
+pc-backup/
+build/
 __pycache__/    
