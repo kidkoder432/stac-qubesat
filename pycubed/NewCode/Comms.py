@@ -276,11 +276,13 @@ def build_beacon_packet(state_code, batt_v, temp_c, mission_time_s):
     batt_v / temp_c may be None (pycubed returns None when a sensor is down);
     those fields are sent as their "unknown" values instead of crashing.
     """
-    batt_mv = 0 if batt_v is None else max(0, min(65535, int(batt_v * 1000)))
+    batt_mv = (
+        0 if batt_v is None else max(0, min(65535, int(round(batt_v * 1000))))
+    )  # round: int(8.03 * 1000) is 8029, one mV low
     temp_raw = 0xFF if temp_c is None else max(0, min(254, int(temp_c) + 40))
     t = max(0, min(0xFFFFFFFF, int(mission_time_s)))
 
-    cs = CALLSIGN[:6].ljust(6).encode("ascii")  # always exactly 6 bytes
+    cs = (CALLSIGN + "      ")[:6].encode("ascii")  # exactly 6 bytes; CircuitPython has no str.ljust (Tyler, 6c7cf1a)
 
     payload = bytearray()
     payload.extend(cs)

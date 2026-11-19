@@ -118,6 +118,22 @@ class TestNewCodeComms(unittest.TestCase):
         self.assertEqual(decoded["temperature_c"], 25)
         self.assertEqual(decoded["mission_time_s"], 99)
 
+    def test_beacon_battery_is_rounded_not_truncated(self):
+        # int(8.03 * 1000) == 8029 in floating point; the beacon must say 8030 mV
+        packet = Comms.build_beacon_packet(Comms.STATE_IDLE, 8.03, 25, 0)
+        self.assertEqual(int.from_bytes(packet[7:9], "big"), 8030)
+
+    def test_beacon_callsign_is_padded_without_str_ljust(self):
+        # CircuitPython's str has no ljust(); the builder must not call it
+        import inspect
+        self.assertNotIn(".ljust(", inspect.getsource(Comms.build_beacon_packet))
+        old = Comms.CALLSIGN
+        try:
+            Comms.CALLSIGN = "AB"
+            self.assertEqual(Comms.build_beacon_packet(Comms.STATE_IDLE, 7.4, 25, 0)[:6], b"AB    ")
+        finally:
+            Comms.CALLSIGN = old
+
     def test_beacon_with_missing_sensors_encodes_unknown(self):
         packet = Comms.build_beacon_packet(Comms.STATE_IDLE, None, None, 120)
         decoded = tinygs_decoder.decode(bytes([Comms.HDR_TELEMETRY]) + packet)
