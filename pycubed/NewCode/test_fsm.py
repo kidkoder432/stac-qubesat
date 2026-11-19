@@ -683,6 +683,35 @@ def test_science_sweeps_all_points_and_counts_completed_sweeps():
     assert all(r[3] != "ERR" and r[4] != "ERR" for r in first)
 
 
+def test_a_point_is_on_the_card_as_soon_as_it_is_measured():
+    """Measuring and writing are one task: no sample waits in memory for a second task."""
+    f, cm, radio = make()
+    cmd(radio, StateID.SCIENCE, lock=True)
+    step(f, cm, 1, 2)
+    before = len(_read_rows())
+    with contextlib.redirect_stdout(io.StringIO()):
+        f._task_receive_data()
+    assert len(_read_rows()) == before + 1
+    assert not hasattr(f, "latest_data")
+    assert "Record to Memory" not in [t.name for t in f.tasks]
+
+
+def test_every_sweep_goes_to_its_own_file_with_its_own_header():
+    f, cm, radio = make()
+    cmd(radio, StateID.SCIENCE, lock=True)
+    step(f, cm, 1, 2)
+    n_points = (f.SWEEP_END_MHZ - f.SWEEP_START_MHZ) // f.SWEEP_STEP_MHZ + 1
+    step(f, cm, 10, n_points * 2 + 5)  # a bit over two sweeps
+    files = _science_files()
+    assert len(files) == 3, "two complete sweeps and the start of a third"
+    for path, sweep in zip(files[:2], ("0", "1")):
+        with open(path) as fh:
+            lines = [ln.strip() for ln in fh if ln.strip()]
+        assert lines[0] == Q.QubeSatFSM.SCIENCE_FILE_HEADER
+        rows = [ln.split(",") for ln in lines[1:]]
+        assert len(rows) == n_points and {r[1] for r in rows} == {sweep}
+
+
 def test_science_file_has_header_and_mission_time_column():
     f, cm, radio = make()
     cmd(radio, StateID.SCIENCE, lock=True)
@@ -966,9 +995,8 @@ def test_sd_nearly_full_deletes_oldest_file_only():
     real = Q._sd_free_bytes
     Q._sd_free_bytes = lambda d: free[0] if len(_science_files()) > 2 else 10**9
     try:
-        f.latest_data = (0, 2800, 0.1, 1e-6)
         with contextlib.redirect_stdout(io.StringIO()):
-            f._task_record_memory()
+            f._record_point(0, 2800, 0.1, 1e-6)
     finally:
         Q._sd_free_bytes = real
     left = _science_files()
@@ -990,8 +1018,7 @@ def test_sd_with_room_deletes_nothing():
         for _ in range(3):
             f._task_init_sd_card()
         n = len(_science_files())
-        f.latest_data = (0, 2800, 0.1, 1e-6)
-        f._task_record_memory()
+        f._record_point(0, 2800, 0.1, 1e-6)
     assert len(_science_files()) == n
 
 

@@ -232,6 +232,7 @@ class QubeSatFSM:
     # Never delete science data unless the card is nearly full (TODO B3); then the oldest file
     # goes first, so the newest sweeps are the ones left to downlink.
     SD_MIN_FREE_BYTES = 256 * 1024
+    SWEEPS_PER_FILE = 1  # a new science file every this many sweeps (1 = one file per sweep)
 
     # Science / comms split (Q-S6, TODO B1). Measured in mission time (seconds since the burn):
     #   first SCIENCE_ONLY_S: 100% SCIENCE (the IARU agreement)
@@ -271,6 +272,7 @@ class QubeSatFSM:
         self._clock_slot = -1
         self._clock_saved_at = 0.0
         self.log_file = None
+        self._file_sweep = None  # the sweep that started the current science file; None = file has no sweep yet
         self.deployed = (
             _load_deployed()
         )  # True once both burn wires have fired (persists)
@@ -310,7 +312,6 @@ class QubeSatFSM:
             "sd_card": 30 * 60,
             "burn_wire": 60,  # retry interval if the burn fails (the 60 min wait is DEPLOY_AFTER_IDLE_S)
             "receive_data": 10,
-            "record_memory": 10,
             "init_payload": (30 * 60),
             "watchdog": 10 * 60,
             "radio_health": 60,
@@ -346,9 +347,6 @@ class QubeSatFSM:
         )
         self.payload_errors = (
             0  # consecutive science points where the payload gave nothing
-        )
-        self.latest_data = (
-            None  # (sweep_id, freq_mhz, contrast, photodiode) waiting to be recorded
         )
 
         self.comms = None
@@ -554,13 +552,6 @@ class QubeSatFSM:
                 self.periods["receive_data"],
                 schedule_later=True,
                 func=self._task_receive_data,
-            ),
-            Task(
-                "Record to Memory",
-                4,
-                self.periods["record_memory"],
-                schedule_later=True,
-                func=self._task_record_memory,
             ),
             Task(
                 "Transition Check",
@@ -833,6 +824,7 @@ class QubeSatFSM:
             with open(log_file, "a") as f:
                 f.write(self.SCIENCE_FILE_HEADER + "\n")
             self.log_file = log_file
+            self._file_sweep = None  # adopted by the first point written to it
             self.sd_card_initialized = True
             self.equipment_check["sd_card"] = True
             print(f"[SD] Ready: {self.log_file}")
@@ -867,26 +859,35 @@ class QubeSatFSM:
                 return
         print("[SD] Card nearly full and no older files left to delete.")
 
-    def _task_record_memory(self):
-        if self.latest_data is None:
-            return
+    def _record_point(self, sweep, freq, contrast, pd):
+        """Append one ODMR point to the science file (called right after it was measured)."""
         if not self.sd_card_initialized or self.log_file is None:
             # After a reboot the FSM goes IDLE -> SCIENCE and never passes through DEPLOY,
             # so the SD card has to be (re)initialized here too.
             self._task_init_sd_card()
             if not self.sd_card_initialized:
-                print("[DATA] SD not ready, skipping record.")
-                return
+                print("[DATA] SD not ready, point not recorded.")
+                return False
+        elif (
+            self._file_sweep is not None
+            and sweep - self._file_sweep >= self.SWEEPS_PER_FILE
+        ):
+            self._task_init_sd_card()  # this point starts a new sweep: new file, new header
+            if not self.sd_card_initialized:
+                print("[DATA] SD not ready, point not recorded.")
+                return False
+        if self._file_sweep is None:
+            self._file_sweep = sweep
         self._sd_make_room()
-        sweep, freq, contrast, pd = self.latest_data
         c = "ERR" if contrast is None else f"{contrast:.4f}"
         p = "ERR" if pd is None else f"{pd:.4e}"
         try:
             with open(self.log_file, "a") as f:
                 f.write(f"{self.mission_time:.1f},{sweep},{freq},{c},{p}\n")
-            self.latest_data = None  # don't write the same sample twice
+            return True
         except Exception as e:
             print("[DATA] Record error:", e)
+            return False
 
     def _task_beacon(self):
         """Queue a TinyGS-format beacon (Comms.build_beacon_packet) for the next TX window."""
@@ -987,7 +988,7 @@ class QubeSatFSM:
 
     def _task_receive_data(self):
         """
-        One ODMR point per run: photodiode reading and optical contrast at the current frequency.
+        One ODMR point per run: photodiode reading and optical contrast at the current frequency, written to the SD card before the task returns.
         Steps SWEEP_START_MHZ..SWEEP_END_MHZ and counts a sweep as complete when the last point is taken.
         (Contrast vs raw photodiode is still open, TODO C4, so both are recorded.)
         """
@@ -1003,8 +1004,8 @@ class QubeSatFSM:
             self.payload_errors = min(self.payload_errors + 1, 255)
         else:
             self.payload_errors = 0
-        self.latest_data = (self.sweep_id, freq, contrast, pd)
         print(f"[SCIENCE] sweep {self.sweep_id} {freq} MHz contrast={contrast} pd={pd}")
+        self._record_point(self.sweep_id, freq, contrast, pd)  # measured and written in the same task
 
         self.current_sweep_freq += self.SWEEP_STEP_MHZ
         if self.current_sweep_freq > self.SWEEP_END_MHZ:
