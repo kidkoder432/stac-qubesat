@@ -385,10 +385,11 @@ def _print_hw_state():
     print(
         f"  Rails:   5V {'ON' if st['v5_rail'] else 'OFF'} | 10V {'ON' if st['10v_rail'] else 'OFF'}"
     )
-    print(
-        "  Heaters: "
-        + " | ".join(f"IN{n} {'ON' if st[f'in{n}'] else 'OFF'}" for n in (1, 2, 3, 4))
-    )
+    heaters = []
+    for n in (1, 2, 3, 4):
+        key = "in" + str(n)  # no f-string inside an f-string: CircuitPython can't parse that
+        heaters.append(f"IN{n} {'ON' if st[key] else 'OFF'}")
+    print("  Heaters: " + " | ".join(heaters))
     return st
 
 
@@ -403,7 +404,7 @@ def _set_heater_checked(n, on):
         )
         return True
     print(
-        f"✗ Heater IN{n} -> {'ON' if on else 'OFF'} not confirmed "
+        f"✗ Heater IN{n} -> {'ON' if on else 'OFF'} not confirmed " +
         f"(ack={ok}, readback={'?' if actual is None else ('ON' if actual else 'OFF')})"
     )
     return False
@@ -646,7 +647,7 @@ def _run_sweep(frequencies, with_pd=True, timeout=30.0):
     }
     print("-----------+----------+----------------+---------+-------------------")
     print(
-        f"{'✗ Sweep CANCELLED' if cancelled else '✓ Sweep complete'}: {len(rows)}/{total} points captured, "
+        f"{'✗ Sweep CANCELLED' if cancelled else '✓ Sweep complete'}: {len(rows)}/{total} points captured, " +
         f"{failed} failed, {elapsed:.1f} s"
     )
     if n_rows:
