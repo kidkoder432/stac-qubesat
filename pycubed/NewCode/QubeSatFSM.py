@@ -764,7 +764,10 @@ class QubeSatFSM:
             for wire in self.BURN_WIRES:
                 if self.burn_done[wire]:
                     continue
-                burn.cubesatBurn(wire, self.BURN_DUTY, self.BURN_DURATION_S)
+                burn.setup()  # the driver clears its ready flag after every burn
+                if not burn.cubesatBurn(wire, self.BURN_DUTY, self.BURN_DURATION_S):
+                    # False means nothing was driven (not set up, or duty/duration of 0)
+                    raise RuntimeError(f"burn wire {wire} did not fire")
                 self.burn_done[wire] = True
                 self.burn_total += (
                     1  # only burns that actually ran count toward the cap

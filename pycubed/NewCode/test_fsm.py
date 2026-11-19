@@ -93,14 +93,25 @@ burn_mode = {"fail": False, "fail_wire": None}
 
 
 class FakeBurnWire:
+    """Same contract as BurnWire.py: setup() before every burn, False (not an exception) if not ready."""
+
     def __init__(self, *a):
-        pass
+        self.ready = False
+
+    def setup(self):
+        self.ready = True
 
     def cubesatBurn(self, num, duty, dur):
+        if duty == 0 or dur == 0:
+            return True
+        if not self.ready:
+            return False
         if burn_mode["fail"] or burn_mode["fail_wire"] == num:
             raise RuntimeError("relay fail")
         burns.append(clock[0])
         burn_wires.append(num)
+        self.ready = False  # the real driver clears it after each burn
+        return True
 
     def burningCheck(self):
         return "not burning"
@@ -491,6 +502,20 @@ def test_both_wires_fire_and_deploy_needs_both():
     f, cm, radio = make()
     step(f, cm, 10, 380)
     assert burn_wires[:2] == ["1", "2"] and f.deployed
+
+
+def test_a_burn_that_returns_false_is_not_deployed():
+    """BurnWire.cubesatBurn returns False (no exception) when nothing was driven; that must not count."""
+    f, cm, radio = make()
+    real = FakeBurnWire.setup
+    FakeBurnWire.setup = lambda self: None  # the driver is never set up
+    try:
+        step(f, cm, 10, 380)
+    finally:
+        FakeBurnWire.setup = real
+    assert not burns and not f.deployed, "nothing fired, so the antenna must not be marked deployed"
+    assert Q._nvm[Q._NVM_DEPLOYED] != Q._DEPLOYED_MAGIC
+    assert f.mission_time == 0
 
 
 def test_wire2_failure_retries_only_wire2():

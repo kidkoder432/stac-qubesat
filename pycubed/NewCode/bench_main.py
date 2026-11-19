@@ -35,10 +35,14 @@ SCIENCE_ONLY_S = None
 class _DryBurn:
     """Stands in for BurnWire on the bench: same calls, nothing is driven."""
 
+    def setup(self):
+        pass
+
     def cubesatBurn(self, burn_num, dutycycle, duration):
         print(
             f"[BENCH] would burn wire {burn_num}: duty={dutycycle}, duration={duration}"
         )
+        return True  # the real driver returns True when it fired
 
     def burningCheck(self):
         return "dry run (burn wire disabled)"
