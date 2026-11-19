@@ -6,3 +6,4 @@ adafruit
 pc-backup/
 build/
 __pycache__/    
+tools/.bin/
