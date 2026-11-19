@@ -20,7 +20,7 @@ Key: `[ ]` to do, `[?]` needs a decision or answer first (blocker named), `[x]` 
 - [x] **A10. SD card full or corrupt** (Q-R2): overwrite old data. Deleting data after downlink needs B3 first. **Done:** oldest science file deleted only when the card is nearly full (207e140).
 - [x] **A11. Radio failure recovery without ground help** (Q-R1): detect a dead radio and re-initialize it. Other failures: see B5. **Done:** radio errors counted in Comms, settings re-applied after 3, an unrecovering radio is a fault (57aedd9). Not tried on real hardware: a hung radio may not raise exceptions.
 - [x] **A12. Keep the TinyGS beacon as the canonical beacon** (Q-C11). Keep the 13-byte status packet unless you decide otherwise (B4). **Done:** no change needed; the status packet now has more fields (B4).
-- [ ] **A13. Burn-wire driver fix** (Q-D1 is the blocker for the numbers, but the structure can change now): `duty cycle` and `duration` must mean what the FSM thinks they mean, and a burn must not block the FSM and radio for about 6 minutes. Two wires doubles that time.
+- [x] **A13. Burn-wire driver fix.** **Done** (Ben's input, Nov 17): the ramp and the 300 s hold are gone; `BurnWire` drives a wire at `dutycycle` percent (0 to 100) for `duration` seconds, so a burn no longer blocks for minutes. The FSM now calls `setup()` before every wire and treats a `False` return as a failed burn (see H9). The duty and duration values are still C1.
 - [x] **A14. Bench-only entry point** (`bench_main.py`, burn wire disabled): lets on-hardware tests start now. Not the flight `main.py` (Q-X1 still open). **Done:** `bench_main.py`, burn wire dry-run, short timings (6e5508e).
 
 ## B. Decisions for you (small, not blocked on the team)
@@ -50,7 +50,7 @@ Key: `[ ]` to do, `[?]` needs a decision or answer first (blocker named), `[x]` 
 
 ## D. Payload firmware (yours, `payload/src`)
 
-- [ ] **D1. Fix the possible boot hang**: `while (!Serial) {}` in `setup()`. Test with no USB host first.
+- [ ] **D1. Remove the serial wait before handoff**: `while (!Serial) {}` in `setup()` is for testing only; Prajwal removes it. Then test boot with no USB host.
 - [ ] **D2. Thermostat in `loop()`** (Q-P4, Q-P7): time-gated check, one RTD read then one heater decision, then return. Needs the RTD-to-heater mapping, thresholds and a battery cutoff.
 - [ ] **D3. Measure time per contrast request and per RTD read** (your photodiode test today). Confirm RTD reads between photodiode reads don't disturb the photodiode values.
 - [ ] **D4. Raw photodiode request** if C4 says so.
@@ -60,17 +60,17 @@ Key: `[ ]` to do, `[?]` needs a decision or answer first (blocker named), `[x]` 
 
 - [ ] **E1. Tell the Comms owner (Tyler) about the changes to `Comms.py`**: the lock bit, the dedup window, and the callback now taking `(code, lock)`.
 - [ ] **E2. Keep `FSM_SPEC.md` in sync with each change.** Copy updates to the Google Doc.
-- [ ] **E3. Commit in small pieces**, one per item above.
+- [x] **E3. Commit in small pieces.** **Done** for the work so far, grouped by topic (new BurnWire, dropping `hardware.py`, docs move, `test_payload.py` fixes, deploy script, `NewCode/lib`).
 
 ## F. New items found while working
 
 - [ ] **F1. Comms treats fresh or corrupt NVM as STOP**, so a satellite launched with erased NVM would not transmit until commanded. Comms owner (Tyler) to confirm that is intended. `bench_main.py` forces IDLE.
-- [ ] **F2. Check on the board:** `len(microcontroller.nvm)` and the SAMD51 NVM endurance, and that the shared `hardware.py` import works (the FSM and BurnWire used `lib.pycubed`, Comms used `pycubed`).
-- [ ] **F3. Hardware watchdog.** The SAMD51 watchdog timeout is short (check the limit); a burn blocks for about 6 minutes per wire, so `BurnWire` would have to feed it. Decide with the burn wire team (R3).
-- [ ] **F4. Two wires block the FSM and radio for about 12 minutes.** Waits on C1 and the `BurnWire` structure (A13).
-- [ ] **F5. Payload with `TESTING = 0`:** the `Serial.print` calls are still in the command handlers. Test with no USB host that nothing stalls.
-- [ ] **F6. Sweep timing.** Measured: a single-point contrast takes about 1 s (20 photodiode reads), so the 10 s "Receive Data" period is what makes a sweep take about 25 min in a 30 min slot. A shorter period (about 2 to 3 s) would allow several sweeps per slot; that is Prajwal's call (laser and microwave on-time). A sweep interrupted by COMMS resumes in the next SCIENCE slot with the same sweep number. The UART photodiode command (`P`) was also timed at about 1 s, which does not fit 50 ms per internal read: either that path has about 1 s of overhead or the first read included the 5 V rail delay. Re-time it with the rail already on.
-- [ ] **F7. Heads-up to Tyler (E1)** now also covers: 433.72 MHz, no dedup window, a radio error counter in `CommsManager`, and the shared `hardware.py` import.
+- [ ] **F2. Check on the board:** `len(microcontroller.nvm)` and the SAMD51 NVM endurance, and that the single `pycubed` import works for every module (the FSM and BurnWire used to import `lib.pycubed`, Comms `pycubed`; `hardware.py` was removed).
+- [ ] **F3. Hardware watchdog.** The SAMD51 watchdog timeout is short (check the limit); a burn now blocks for `duration` seconds per wire (30 s at the placeholder), which may fit inside the limit; check it. Decide with the burn wire team (R3).
+- [x] **F4. Two wires block the FSM and radio** for `duration` each (about a minute at the 30 s placeholder), no longer about 12 minutes. Still depends on the real value from C1.
+- [ ] **F5. Payload with `TESTING = 0` (and the serial wait removed, D1):** the `Serial.print` calls are still in the command handlers. Test with no USB host that nothing stalls.
+- [ ] **F6. Sweep timing.** Measured: a single-point contrast takes about 1 s (20 photodiode reads), so the 10 s "Receive Data" period is what makes a sweep take about 25 min in a 30 min slot. **New measurement (Nov 16):** a full 151-point sweep over UART (contrast plus photodiode per point) took about 3.5 minutes, about 1.4 s per point, so the payload can do a sweep about 7 times faster than the FSM's 10 s period allows. The period is Prajwal's call (laser and microwave on-time). A sweep interrupted by COMMS resumes in the next SCIENCE slot with the same sweep number. The UART photodiode command (`P`) was also timed at about 1 s, which does not fit 50 ms per internal read. The 3.5 minute sweep (1.4 s per point, about 1 s of it contrast) suggests a photodiode read is well under 1 s once the rail is on, so the earlier 1 s probably included the 5 V rail delay. Still worth timing `P` alone with the rail already on.
+- [ ] **F7. Heads-up to Tyler (E1)** now also covers: 437.42 MHz, no dedup window, a radio error counter in `CommsManager`, and the single `pycubed` import (`hardware.py` removed).
 
 ## G. Comms merge (Tyler's `tinygs` branch + the lock bit), not committed, for review
 
@@ -81,6 +81,31 @@ Key: `[ ]` to do, `[?]` needs a decision or answer first (blocker named), `[x]` 
 - [ ] **G5. Ask Tyler:** should fresh or corrupt NVM mean STOP (silent radio)? Beacon mission time: since boot, or since the burn?
 - [ ] **G6. Bench-test over the air** before relying on any of it: both directions, early and timed FSK return, TinyGS decoding of a beacon. Burn wires disconnected (Tyler's warning applies to the ArcticaNova BurnWire, not ours, which has a `__main__` guard).
 - [ ] **G7. Ground side:** a ground station using `pycubed_rfm9x` must use `Comms.send_raw()` and the same `build_state_command(state, lock)`.
+
+## H. Found on the board (Nov 12 to 16)
+
+- [x] **H1. CircuitPython f-strings do not support `!r`.** `{e!r}` in two FSM prints raised a syntax error at import. Now `{repr(e)}`. Other conversions (`!s`, `!a`) and f-string `=` are not used anywhere.
+- [x] **H2. SD card:** `[Errno 19] No such device` at startup was the card not being detected (reseat, FAT32, 32 GB or less); the FSM already retries and prints `[SD] Init failed`.
+- [x] **H3. `test_payload.py` sweep logging.** The sweep log wrote only the header: the row line used `format()`, which CircuitPython does not have, and the surrounding `except` hid the error. Fixed with an f-string; write errors and the SD-unavailable reason are now printed.
+- [x] **H4. `test_payload.py` memory.** A 151-point sweep hit `memory allocation failed, allocating 1024 bytes` (growing lists on a small, fragmented heap). The sweep now preallocates its rows, drops the latency list and calls `gc.collect()` every 10 points. Precompiling the test to `.mpy` would free more heap.
+- [x] **H5. Payload console sweep logging to the SD card works on the board** (Prajwal tested after H3 and H4).
+- [ ] **H6. The FSM writing science data to the SD card is not tested yet.** Data rows are only written in SCIENCE, so first confirm the FSM reaches SCIENCE (battery, burn wire marked done, no saved lock).
+
+- [x] **H7. Measuring and recording are one task.** The separate "Record to Memory" task is gone: `_task_receive_data` writes each point to the SD card as soon as it is measured (`_record_point`), so a sample can no longer be overwritten before it is written. The period of that one task is still the open question in F6 (a whole sweep per run, or a short period so the loop keeps servicing comms and the battery check between points).
+
+- [x] **H8. Tools for working without hardware.** `sim/` runs the real FSM and Comms against a fake world (virtual clock, synthetic ODMR spectrum, fake radio and ground station, SD card and fault injection): `python3 sim/cli.py` (prints events as they happen during `run` and `until`), scenario tests in `python3 sim/test_sim.py`; it now runs the real `BurnWire.py` over fake pwmio/board modules; see `sim/README.md` for what it does and does not model. `python3 tools/check_circuitpython.py --download` compiles every board file with the CircuitPython 8.2.10 compiler and catches syntax the board rejects (`!r`, an f-string inside an f-string expression, two f-strings next to each other; join those with `+`).
+
+- [x] **H9. The FSM ignored the new BurnWire contract.** The updated `BurnWire` needs `setup()` before each burn and returns `False` (no exception) when nothing was driven. The FSM did neither: it would have marked both wires done, set `deployed`, saved it to NVM and started the mission clock with no burn having happened. Fixed (`setup()` per wire, `False` raises); `bench_main._DryBurn`, `test_fsm.py` and the simulator now follow the same contract, and a test pins the case.
+- [ ] **H10. A burn status string is misleading.** After a successful burn `burningCheck()` returns "Burn wire not ready to fire. Call setup() first." (the ready flag is cleared after each burn), and the FSM prints it as `[DEPLOY] Burn wire status`. Cosmetic; for the BurnWire owner.
+- [ ] **H11. The SD card is never remounted while running.** `lib/pycubed.py` mounts `/sd` once in `__init__`. A card missing at boot, or pulled and put back later, stays unusable until the next boot; `new_file()` returns `None` or writes fail, and the FSM only retries `new_file()` (the simulator reproduces this). Decide what the FSM should do when SD writes keep failing (for example, a controlled reboot after N failures) and whether that is acceptable in flight. This is a design call; not changed.
+
+- [x] **H12. One science file per sweep.** The FSM only created a science file when DEPLOY started or after a reboot, so a run produced one ever-growing file (about 260 KB a day, one file for 14 days in the simulator) that nothing could send or delete. `_record_point` now starts a new file, with its own header, when a point belongs to a new sweep (`SWEEPS_PER_FILE = 1`, change the constant for several sweeps per file). A reboot still starts a new file, and a half sweep stays in the old one. Not measured on the board: `cubesat.new_file()` scans file numbers from 0 with `stat()`, so with hundreds of files each new file may block for a noticeable time.
+
+- [ ] **H13. Re-burn policy is undecided.** The antenna watchdog re-fires both wires every 12 h (up to 20 burns per boot) while no uplink command has been heard; with no ground contact that is 10 burns per wire in 14 days. Prajwal has not chosen a policy yet (options discussed: never re-burn after a good burn; re-burn rarely with a small cap; keep as is). Needs the burn team's view on whether a second burn can help at all, and how long the ground station may take to make first contact. Not changed.
+- [ ] **H14. Satellite-to-ground protocol and a simulated ground station.** Every open question, grouped by owner, is in `docs/OPEN_QUESTIONS.md`. Prajwal's draft protocol is `docs/COMMS_SPEC.md` (open questions P1a to P30, sorted by owner, for him and Tyler), written from `docs/TINYGS_AND_RADIO_CONSTRAINTS.md`; the simulator's ground station then implements it. Findings in that document: TinyGS now wants a Kaitai `.ksy` decoder sent by email (our `tinygs_decoder.py` still says Telegram bot); TinyGS forwards only publicly documented payloads; no documented packet-size limit or uplink; our 18-byte status packet and any science packet need their own `.ksy`; SCIENCE sends no TinyGS beacon.
+
+- [x] **H15. Tyler's `tinygs` branch, new since the merge** (checked Nov 18, `og-qubesat`, commits 6c7cf1a and 0c7e9b1): (a) `6c7cf1a` fixes a **CircuitPython crash in the beacon** (`str.ljust` does not exist there) and rounds the battery value; ported into our `Comms.py` with two tests (the compile check and the simulator cannot see this kind of runtime error); (b) `0c7e9b1` adds `groundstation/` (uplink only, see H14 and `docs/OPEN_QUESTIONS.md`). Not copied into this repo: Tyler can open a PR for it.
+- [ ] **H16. Ground-side changes needed** (for Tyler): frequency 433.0 to 437.42 MHz, a lock option for state commands, and the missing receive side (downlink decoder, storage, handshake reply, acknowledgements).
 
 ## Suggested order
 
